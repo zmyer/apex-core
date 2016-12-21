@@ -44,6 +44,7 @@ import org.codehaus.jettison.json.JSONObject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.apex.engine.util.StreamingAppFactory;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.IOUtils;
 import org.apache.commons.lang.NotImplementedException;
@@ -62,7 +63,6 @@ import com.google.common.collect.Sets;
 
 import com.datatorrent.api.Context;
 import com.datatorrent.api.StreamingApplication;
-import com.datatorrent.api.annotation.ApplicationAnnotation;
 import com.datatorrent.stram.StramClient;
 import com.datatorrent.stram.StramLocalCluster;
 import com.datatorrent.stram.StramUtils;
@@ -88,11 +88,12 @@ import com.datatorrent.stram.security.StramUserLogin;
 public class StramAppLauncher
 {
   public static final String CLASSPATH_RESOLVERS_KEY_NAME = StreamingApplication.DT_PREFIX + "classpath.resolvers";
-  public static final String LIBJARS_CONF_KEY_NAME = "tmplibjars";
-  public static final String FILES_CONF_KEY_NAME = "tmpfiles";
-  public static final String ARCHIVES_CONF_KEY_NAME = "tmparchives";
-  public static final String ORIGINAL_APP_ID = "tmpOriginalAppId";
-  public static final String QUEUE_NAME = "queueName";
+  public static final String LIBJARS_CONF_KEY_NAME = "_apex.libjars";
+  public static final String FILES_CONF_KEY_NAME = "_apex.files";
+  public static final String ARCHIVES_CONF_KEY_NAME = "_apex.archives";
+  public static final String ORIGINAL_APP_ID = "_apex.originalAppId";
+  public static final String QUEUE_NAME = "_apex.queueName";
+  public static final String TAGS = "_apex.tags";
 
   private static final Logger LOG = LoggerFactory.getLogger(StramAppLauncher.class);
   private File jarFile;
@@ -461,36 +462,16 @@ public class StramAppLauncher
       try {
         final Class<?> clazz = cl.loadClass(className);
         if (!Modifier.isAbstract(clazz.getModifiers()) && StreamingApplication.class.isAssignableFrom(clazz)) {
-          final AppFactory appConfig = new AppFactory()
+          final AppFactory appConfig = new StreamingAppFactory(classFileName, clazz)
           {
             @Override
-            public String getName()
-            {
-              return classFileName;
-            }
-
-            @Override
-            public String getDisplayName()
-            {
-              ApplicationAnnotation an = clazz.getAnnotation(ApplicationAnnotation.class);
-              if (an != null) {
-                return an.name();
-              } else {
-                return classFileName;
-              }
-            }
-
-            @Override
-            public LogicalPlan createApp(LogicalPlanConfiguration conf)
+            public LogicalPlan createApp(LogicalPlanConfiguration planConfig)
             {
               // load class from current context class loader
               Class<? extends StreamingApplication> c = StramUtils.classForName(className, StreamingApplication.class);
               StreamingApplication app = StramUtils.newInstance(c);
-              LogicalPlan dag = new LogicalPlan();
-              conf.prepareDAG(dag, app, getName());
-              return dag;
+              return super.createApp(app, planConfig);
             }
-
           };
           appResourceList.add(appConfig);
         }
@@ -630,6 +611,12 @@ public class StramAppLauncher
       client.setArchives(conf.get(ARCHIVES_CONF_KEY_NAME));
       client.setOriginalAppId(conf.get(ORIGINAL_APP_ID));
       client.setQueueName(conf.get(QUEUE_NAME));
+      String tags = conf.get(TAGS);
+      if (tags != null) {
+        for (String tag : tags.split(",")) {
+          client.addTag(tag.trim());
+        }
+      }
       client.startApplication();
       return client.getApplicationReport().getApplicationId();
     } finally {

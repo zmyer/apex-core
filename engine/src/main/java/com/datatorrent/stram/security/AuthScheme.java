@@ -24,10 +24,12 @@ package com.datatorrent.stram.security;
  * BASIC: BASIC HTTP authentication - RFC 2617
  * SPNEGO: Kerberos based SPNEGO authentication - RFC 4559
  * KERBEROS: Kerberos authentication - RFC 4120
+ *
+ * @since 3.5.0
  */
 public enum AuthScheme
 {
-  BASIC("basic"), SPNEGO("kerberos"), KERBEROS("kerberos-standard");
+  BASIC("basic"), DIGEST("digest"), SPNEGO("kerberos"), KERBEROS("kerberos-standard");
 
   String name;
 
