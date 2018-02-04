@@ -20,6 +20,8 @@ package com.datatorrent.stram.client;
 
 import java.io.File;
 import java.io.IOException;
+import java.net.URL;
+import java.util.LinkedHashSet;
 
 import org.junit.Assert;
 import org.junit.Rule;
@@ -55,11 +57,147 @@ public class StramAppLauncherTest
 
   @PrepareForTest({StramAppLauncher.class})
   @PowerMockIgnore({"javax.xml.*", "org.w3c.*", "org.apache.hadoop.*", "org.apache.log4j.*"})
+  public static class LoadDependenciesTest
+  {
+
+    @Rule
+    public PowerMockRule rule = new PowerMockRule();
+
+    @Rule
+    public TestWatcher setup = new TestWatcher()
+    {
+      @Override
+      protected void starting(Description description)
+      {
+        super.starting(description);
+        suppress(method(StramAppLauncher.class, "init"));
+      }
+    };
+
+    @Test
+    public void testLoadDependenciesSetsParentClassLoader() throws Exception
+    {
+      // Setup
+      Configuration conf = new Configuration();
+      FileSystem fs = FileSystem.newInstance(conf);
+      StramAppLauncher appLauncher = new StramAppLauncher(fs, conf);
+
+      Whitebox.setInternalState(appLauncher, "launchDependencies", new LinkedHashSet<URL>());
+
+      // Get initial contextClassLoader
+      ClassLoader initialClassLoader = Thread.currentThread().getContextClassLoader();
+
+      appLauncher.loadDependencies();
+
+      // Make sure that new contextClassLoader has initialClassLoader as parent
+      ClassLoader currentClassLoader = Thread.currentThread().getContextClassLoader();
+
+      Assert.assertSame(initialClassLoader, currentClassLoader.getParent());
+    }
+
+    @Test
+    public void testResetContextClassLoaderResetsToInitialClassLoader() throws Exception
+    {
+      // Setup
+      Configuration conf = new Configuration();
+      FileSystem fs = FileSystem.newInstance(conf);
+      StramAppLauncher appLauncher = new StramAppLauncher(fs, conf);
+
+      Whitebox.setInternalState(appLauncher, "launchDependencies", new LinkedHashSet<URL>());
+
+      // Get initial contextClassLoader
+      ClassLoader initialClassLoader = Thread.currentThread().getContextClassLoader();
+
+      appLauncher.loadDependencies();
+      appLauncher.resetContextClassLoader();
+
+      ClassLoader currentClassLoader = Thread.currentThread().getContextClassLoader();
+      Assert.assertSame(initialClassLoader, currentClassLoader);
+    }
+
+    @Test
+    public void testResetContextClassloaderOnlyOnInitialThread() throws Exception
+    {
+      // Setup
+      Configuration conf = new Configuration();
+      FileSystem fs = FileSystem.newInstance(conf);
+      final StramAppLauncher appLauncher = new StramAppLauncher(fs, conf);
+      Whitebox.setInternalState(appLauncher, "launchDependencies", new LinkedHashSet<URL>());
+
+      new AsyncTester(new Runnable()
+      {
+        @Override
+        public void run()
+        {
+          try {
+            appLauncher.loadDependencies();
+          } catch (Exception e) {
+            Assert.fail(e.getMessage());
+          }
+        }
+      }).start().test();
+
+      new AsyncTester(new Runnable()
+      {
+        @Override
+        public void run()
+        {
+          try {
+            appLauncher.resetContextClassLoader();
+            Assert.fail("An exception should be thrown");
+          } catch (RuntimeException e) {
+            // catch as expected
+          }
+        }
+      }).start().test();
+    }
+
+    @Test
+    public void testLoadDependenciesOnlyOnInitialThread() throws Exception
+    {
+      // Setup
+      Configuration conf = new Configuration();
+      FileSystem fs = FileSystem.newInstance(conf);
+      final StramAppLauncher appLauncher = new StramAppLauncher(fs, conf);
+      Whitebox.setInternalState(appLauncher, "launchDependencies", new LinkedHashSet<URL>());
+
+      new AsyncTester(new Runnable()
+      {
+        @Override
+        public void run()
+        {
+          try {
+            appLauncher.loadDependencies();
+          } catch (Exception e) {
+            Assert.fail(e.getMessage());
+          }
+        }
+      }).start().test();
+
+      new AsyncTester(new Runnable()
+      {
+        @Override
+        public void run()
+        {
+          try {
+            appLauncher.loadDependencies();
+            Assert.fail("An exception should be thrown");
+          } catch (RuntimeException e) {
+            // catch as expected
+          }
+        }
+      }).start().test();
+    }
+  }
+
+  @PrepareForTest({StramAppLauncher.class})
+  @PowerMockIgnore({"javax.xml.*", "org.w3c.*", "org.apache.hadoop.*", "org.apache.log4j.*"})
   public static class RefreshTokenTests
   {
     File workspace;
     File sourceKeytab;
     File dfsDir;
+    File apexDfsDir;
 
     static final String principal = "username/group@domain";
 
@@ -82,6 +220,7 @@ public class StramAppLauncherTest
           throw new RuntimeException(e);
         }
         dfsDir = new File(workspace, "dst");
+        apexDfsDir = new File(workspace, "adst");
         suppress(method(StramAppLauncher.class, "init"));
       }
 
@@ -98,7 +237,7 @@ public class StramAppLauncherTest
     {
       Configuration conf = new Configuration(false);
       File storeKeytab = new File(dfsDir, "keytab2");
-      conf.set(StramClientUtils.KEY_TAB_FILE, storeKeytab.getPath());
+      conf.set(StramClientUtils.TOKEN_REFRESH_KEYTAB, storeKeytab.getPath());
       StramUserLogin.authenticate(principal, sourceKeytab.getPath());
       LogicalPlan dag = applyTokenRefreshKeytab(FileSystem.newInstance(conf), conf);
       Assert.assertEquals("Token refresh principal", principal, dag.getValue(LogicalPlan.PRINCIPAL));
@@ -136,6 +275,41 @@ public class StramAppLauncherTest
       Assert.assertEquals("Token refresh principal", principal, dag.getValue(LogicalPlan.PRINCIPAL));
       Assert.assertEquals("Token refresh keytab path", new Path(fs.getUri().getScheme(), fs.getUri().getAuthority(),
           new File(dfsDir, sourceKeytab.getName()).getAbsolutePath()).toString(), dag.getValue(LogicalPlan.KEY_TAB_FILE));
+    }
+
+    @Test
+    public void testUserLoginTokenRefreshKeytabWithApexDFS() throws Exception
+    {
+      Configuration conf = new Configuration(false);
+      /*
+      spy(StramUserLogin.class);
+      when(StramUserLogin.getPrincipal()).thenReturn(principal);
+      when(StramUserLogin.getKeytab()).thenReturn(sourceKeytab.getPath());
+      */
+      StramUserLogin.authenticate(principal, sourceKeytab.getPath());
+      testDFSTokenPathWithApexDFS(conf);
+    }
+
+    @Test
+    public void testAuthPropTokenRefreshKeytabWithApexDFS() throws Exception
+    {
+      Configuration conf = new Configuration(false);
+      conf.set(StramUserLogin.DT_AUTH_PRINCIPAL, principal);
+      conf.set(StramUserLogin.DT_AUTH_KEYTAB, sourceKeytab.getPath());
+      StramUserLogin.authenticate(conf);
+      testDFSTokenPathWithApexDFS(conf);
+    }
+
+    private void testDFSTokenPathWithApexDFS(Configuration conf) throws Exception
+    {
+      FileSystem fs = FileSystem.newInstance(conf);
+      conf.set(StramClientUtils.DT_DFS_ROOT_DIR, dfsDir.getAbsolutePath());
+      conf.set(StramClientUtils.APEX_APP_DFS_ROOT_DIR, apexDfsDir.getAbsolutePath());
+      conf.setBoolean(StramUserLogin.DT_APP_PATH_IMPERSONATED, true); // needs to be true for APEX_APP_DFS_ROOT_DIR to be honored
+      LogicalPlan dag = applyTokenRefreshKeytab(fs, conf);
+      Assert.assertEquals("Token refresh principal", principal, dag.getValue(LogicalPlan.PRINCIPAL));
+      Assert.assertEquals("Token refresh keytab path", new Path(fs.getUri().getScheme(), fs.getUri().getAuthority(),
+          new File(apexDfsDir, sourceKeytab.getName()).getAbsolutePath()).toString(), dag.getValue(LogicalPlan.KEY_TAB_FILE));
     }
 
     private LogicalPlan applyTokenRefreshKeytab(FileSystem fs, Configuration conf) throws Exception

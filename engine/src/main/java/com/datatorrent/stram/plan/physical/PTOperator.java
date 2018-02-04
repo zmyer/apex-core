@@ -255,7 +255,7 @@ public class PTOperator implements java.io.Serializable
   Checkpoint recoveryCheckpoint;
   public int failureCount = 0;
   public int loadIndicator = 0;
-  public List<? extends StatsListener> statsListeners;
+  public List<? extends StatsListener.StatsListenerWithContext> statsListeners;
   public final OperatorStatus stats;
 
   final Map<Locality, HostOperatorSet> groupings = Maps.newHashMapWithExpectedSize(3);
@@ -359,7 +359,7 @@ public class PTOperator implements java.io.Serializable
     if (partitionKeys != null) {
       pkeys = Maps.newHashMapWithExpectedSize(partitionKeys.size());
       for (Map.Entry<InputPortMeta, PartitionKeys> e : partitionKeys.entrySet()) {
-        pkeys.put(e.getKey().getPortObject(), e.getValue());
+        pkeys.put(e.getKey().getPort(), e.getValue());
       }
     }
     return pkeys;
@@ -497,7 +497,7 @@ public class PTOperator implements java.io.Serializable
   @Override
   public String toString()
   {
-    return new ToStringBuilder(this, ToStringStyle.SHORT_PREFIX_STYLE).append("id", id).append("name", name).toString();
+    return new ToStringBuilder(this, ToStringStyle.SHORT_PREFIX_STYLE).append("id", id).append("name", name).append("state", state).toString();
   }
 
 }

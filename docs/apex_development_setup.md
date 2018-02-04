@@ -62,7 +62,7 @@ Confirm by running the following commands and comparing with output that show in
 Creating New Apex Project
 -------------------------------------------------------------------------------
 
-After development tools are configured, you can now use the maven archetype to create a basic Apache Apex project.  **Note:** When executing the commands below, replace `3.4.0` by [latest available version](http://apex.apache.org/downloads.html) of Apache Apex.
+After development tools are configured, you can now use the maven archetype to create a basic Apache Apex project.  **Note:** When executing the commands below, you can optionally replace `RELEASE` with a [specific version](http://apex.apache.org/downloads.html) of Apache Apex.
 
 
 * **Windows** - Create a new Windows command file called `newapp.cmd` by copying the lines below, and execute it.  When you run this file, the properties will be displayed and you will be prompted with `` Y: :``; just press **Enter** to complete the project generation.  The caret (^) at the end of some lines indicates that a continuation line follows. 
@@ -72,7 +72,7 @@ After development tools are configured, you can now use the maven archetype to c
         setlocal
         mvn archetype:generate ^
          -DarchetypeGroupId=org.apache.apex ^
-         -DarchetypeArtifactId=apex-app-archetype -DarchetypeVersion=3.4.0 ^
+         -DarchetypeArtifactId=apex-app-archetype -DarchetypeVersion=RELEASE ^
          -DgroupId=com.example -Dpackage=com.example.myapexapp -DartifactId=myapexapp ^
          -Dversion=1.0-SNAPSHOT
         endlocal
@@ -82,7 +82,7 @@ After development tools are configured, you can now use the maven archetype to c
 
         mvn archetype:generate \
          -DarchetypeGroupId=org.apache.apex \
-         -DarchetypeArtifactId=apex-app-archetype -DarchetypeVersion=3.4.0 \
+         -DarchetypeArtifactId=apex-app-archetype -DarchetypeVersion=RELEASE \
          -DgroupId=com.example -Dpackage=com.example.myapexapp -DartifactId=myapexapp \
          -Dversion=1.0-SNAPSHOT
 
@@ -158,7 +158,4 @@ After the build completes, you should see the demo application package files in 
 Sandbox
 -------------------------------------------------------------------------------
 
-To jump start development with an Apache Hadoop single node cluster, [DataTorrent Sandbox](https://www.datatorrent.com/download) powered by VirtualBox is available on Windows, Linux, or Mac platforms.  The sandbox is configured by default to run with 6GB RAM; if your development machine has 16GB or more, you can increase the sandbox RAM to 8GB or more using the VirtualBox console.  This will yield better performance and support larger applications.  The advantage of developing in the sandbox is that most of the tools (e.g. _jdk_, _git_, _maven_), Hadoop YARN and HDFS, and a distribution of Apache Apex and DataTorrent RTS are pre-installed.  The disadvantage is that the sandbox is a memory-limited environment, and requires settings changes and restarts to adjust memory available for development and testing.
-
-
-
+To jump-start development with Apex, please refer to the [Downloads](https://apex.apache.org/downloads.html) section of the Apache Apex website, which provides a list of 3rd party Apex binary packages and sandbox environments.

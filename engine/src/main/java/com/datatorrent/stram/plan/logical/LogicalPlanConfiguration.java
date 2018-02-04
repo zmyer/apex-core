@@ -85,6 +85,13 @@ import com.datatorrent.stram.plan.logical.LogicalPlan.OutputPortMeta;
 import com.datatorrent.stram.plan.logical.LogicalPlan.StreamMeta;
 import com.datatorrent.stram.util.ObjectMapperFactory;
 
+import static org.apache.apex.api.plugin.DAGSetupEvent.Type.POST_CONFIGURE_DAG;
+import static org.apache.apex.api.plugin.DAGSetupEvent.Type.POST_POPULATE_DAG;
+import static org.apache.apex.api.plugin.DAGSetupEvent.Type.POST_VALIDATE_DAG;
+import static org.apache.apex.api.plugin.DAGSetupEvent.Type.PRE_CONFIGURE_DAG;
+import static org.apache.apex.api.plugin.DAGSetupEvent.Type.PRE_POPULATE_DAG;
+import static org.apache.apex.api.plugin.DAGSetupEvent.Type.PRE_VALIDATE_DAG;
+
 /**
  *
  * Builder for the DAG logical representation of operators and streams from properties.<p>
@@ -102,14 +109,14 @@ public class LogicalPlanConfiguration
   public static final String GATEWAY_PREFIX = StreamingApplication.DT_PREFIX + "gateway.";
   public static final String GATEWAY_LISTEN_ADDRESS = GATEWAY_PREFIX + "listenAddress";
 
-  public static final String STREAM_PREFIX = StreamingApplication.DT_PREFIX + "stream.";
+  public static final String STREAM_PREFIX = StreamingApplication.APEX_PREFIX + "stream.";
   public static final String STREAM_SOURCE = "source";
   public static final String STREAM_SINKS = "sinks";
   public static final String STREAM_TEMPLATE = "template";
   public static final String STREAM_LOCALITY = "locality";
   public static final String STREAM_SCHEMA = "schema";
 
-  public static final String OPERATOR_PREFIX = StreamingApplication.DT_PREFIX + "operator.";
+  public static final String OPERATOR_PREFIX = StreamingApplication.APEX_PREFIX + "operator.";
   public static final String OPERATOR_CLASSNAME = "classname";
   public static final String OPERATOR_TEMPLATE = "template";
 
@@ -133,6 +140,21 @@ public class LogicalPlanConfiguration
     Object[] serial = new Object[]{Context.DAGContext.serialVersionUID, OperatorContext.serialVersionUID, PortContext.serialVersionUID};
     LOG.debug("Initialized attributes {}", serial);
   }
+
+  public static final String KEY_APPLICATION_NAME = keyAndDeprecation(Context.DAGContext.APPLICATION_NAME);
+  public static final String KEY_GATEWAY_CONNECT_ADDRESS = keyAndDeprecation(Context.DAGContext.GATEWAY_CONNECT_ADDRESS);
+  public static final String KEY_GATEWAY_USE_SSL = keyAndDeprecation(Context.DAGContext.GATEWAY_USE_SSL);
+  public static final String KEY_GATEWAY_USER_NAME = keyAndDeprecation(Context.DAGContext.GATEWAY_USER_NAME);
+  public static final String KEY_GATEWAY_PASSWORD = keyAndDeprecation(Context.DAGContext.GATEWAY_PASSWORD);
+
+  private static String keyAndDeprecation(Attribute<?> attr)
+  {
+    String key = StreamingApplication.APEX_PREFIX + attr.getName();
+    Configuration.addDeprecation(StreamingApplication.DT_PREFIX + attr.getName(), key);
+    return key;
+  }
+
+  private final DAGSetupPluginManager pluginManager;
 
   /**
    * This represents an element that can be referenced in a DT property.
@@ -274,7 +296,7 @@ public class LogicalPlanConfiguration
         ambiguousAttributes.addAll(childElement.getAmbiguousAttributes());
 
         @SuppressWarnings("unchecked")
-        Set<String> intersection = (Set<String>)Sets.newHashSet(CollectionUtils.intersection(allChildAttributes, allAttributes));
+        Set<String> intersection = Sets.newHashSet(CollectionUtils.intersection(allChildAttributes, allAttributes));
         ambiguousAttributes.addAll(intersection);
         allChildAttributes.addAll(allAttributes);
       }
@@ -1640,6 +1662,7 @@ public class LogicalPlanConfiguration
   {
     this.conf = conf;
     this.addFromConfiguration(conf);
+    this.pluginManager = DAGSetupPluginManager.getInstance(conf);
   }
 
   /**
@@ -1648,19 +1671,16 @@ public class LogicalPlanConfiguration
    */
   public final void addFromConfiguration(Configuration conf)
   {
-    addFromProperties(toProperties(conf, StreamingApplication.DT_PREFIX), null);
+    addFromProperties(toProperties(conf), null);
   }
 
-  public static Properties toProperties(Configuration conf, String prefix)
+  private static Properties toProperties(Configuration conf)
   {
     Iterator<Entry<String, String>> it = conf.iterator();
     Properties props = new Properties();
     while (it.hasNext()) {
       Entry<String, String> e = it.next();
-      // filter relevant entries
-      if (e.getKey().startsWith(prefix)) {
-        props.put(e.getKey(), e.getValue());
-      }
+      props.put(e.getKey(), e.getValue());
     }
     return props;
   }
@@ -1700,7 +1720,7 @@ public class LogicalPlanConfiguration
     JSONArray operatorArray = json.getJSONArray("operators");
     for (int i = 0; i < operatorArray.length(); i++) {
       JSONObject operator = operatorArray.getJSONObject(i);
-      String operatorPrefix = StreamingApplication.DT_PREFIX + StramElement.OPERATOR.getValue() + KEY_SEPARATOR + operator.getString("name") + ".";
+      String operatorPrefix = StreamingApplication.APEX_PREFIX + StramElement.OPERATOR.getValue() + KEY_SEPARATOR + operator.getString("name") + ".";
       prop.setProperty(operatorPrefix + "classname", operator.getString("class"));
       JSONObject operatorProperties = operator.optJSONObject("properties");
       if (operatorProperties != null) {
@@ -1743,7 +1763,7 @@ public class LogicalPlanConfiguration
 
     JSONObject appAttributes = json.optJSONObject("attributes");
     if (appAttributes != null) {
-      String attributesPrefix = StreamingApplication.DT_PREFIX + StramElement.ATTR.getValue() + KEY_SEPARATOR;
+      String attributesPrefix = StreamingApplication.APEX_PREFIX + StramElement.ATTR.getValue() + KEY_SEPARATOR;
       @SuppressWarnings("unchecked")
       Iterator<String> iter = appAttributes.keys();
       while (iter.hasNext()) {
@@ -1756,7 +1776,7 @@ public class LogicalPlanConfiguration
     for (int i = 0; i < streamArray.length(); i++) {
       JSONObject stream = streamArray.getJSONObject(i);
       String name = stream.optString("name", "stream-" + i);
-      String streamPrefix = StreamingApplication.DT_PREFIX + StramElement.STREAM.getValue() + KEY_SEPARATOR + name + KEY_SEPARATOR;
+      String streamPrefix = StreamingApplication.APEX_PREFIX + StramElement.STREAM.getValue() + KEY_SEPARATOR + name + KEY_SEPARATOR;
       JSONObject source = stream.getJSONObject("source");
       prop.setProperty(streamPrefix + STREAM_SOURCE, source.getString("operatorName") + KEY_SEPARATOR + source.getString("portName"));
       JSONArray sinks = stream.getJSONArray("sinks");
@@ -1784,7 +1804,7 @@ public class LogicalPlanConfiguration
 
 
   /**
-   * Read node configurations from opProps. The opProps can be in any
+   * Read operator configurations from properties. The properties can be in any
    * random order, as long as they represent a consistent configuration in their
    * entirety.
    *
@@ -1800,7 +1820,8 @@ public class LogicalPlanConfiguration
     for (final String propertyName : props.stringPropertyNames()) {
       String propertyValue = props.getProperty(propertyName);
       this.properties.setProperty(propertyName, propertyValue);
-      if (propertyName.startsWith(StreamingApplication.DT_PREFIX)) {
+      if (propertyName.startsWith(StreamingApplication.DT_PREFIX) ||
+          propertyName.startsWith(StreamingApplication.APEX_PREFIX)) {
         String[] keyComps = propertyName.split(KEY_SEPARATOR_SPLIT_REGEX);
         parseStramPropertyTokens(keyComps, 1, propertyName, propertyValue, stramConf);
       }
@@ -2052,18 +2073,30 @@ public class LogicalPlanConfiguration
     return Collections.unmodifiableMap(this.stramConf.appAliases);
   }
 
+  private LogicalPlan populateDAGAndValidate(LogicalPlanConfiguration tb, String appName)
+  {
+    LogicalPlan dag = new LogicalPlan();
+    pluginManager.setup(dag);
+    pluginManager.dispatch(PRE_POPULATE_DAG.event);
+    tb.populateDAG(dag);
+    // configure with embedded settings
+    tb.prepareDAG(dag, null, appName);
+    pluginManager.dispatch(POST_POPULATE_DAG.event);
+    // configure with external settings
+    prepareDAG(dag, null, appName);
+    pluginManager.dispatch(PRE_VALIDATE_DAG.event);
+    dag.validate();
+    pluginManager.dispatch(POST_VALIDATE_DAG.event);
+    pluginManager.teardown();
+    return dag;
+  }
+
   public LogicalPlan createFromProperties(Properties props, String appName) throws IOException
   {
     // build DAG from properties
     LogicalPlanConfiguration tb = new LogicalPlanConfiguration(new Configuration(false));
     tb.addFromProperties(props, conf);
-    LogicalPlan dag = new LogicalPlan();
-    tb.populateDAG(dag);
-    // configure with embedded settings
-    tb.prepareDAG(dag, null, appName);
-    // configure with external settings
-    prepareDAG(dag, null, appName);
-    return dag;
+    return populateDAGAndValidate(tb, appName);
   }
 
   public LogicalPlan createFromJson(JSONObject json, String appName) throws Exception
@@ -2071,25 +2104,25 @@ public class LogicalPlanConfiguration
     // build DAG from properties
     LogicalPlanConfiguration tb = new LogicalPlanConfiguration(new Configuration(false));
     tb.addFromJson(json, conf);
-    LogicalPlan dag = new LogicalPlan();
-    tb.populateDAG(dag);
-    // configure with embedded settings
-    tb.prepareDAG(dag, null, appName);
-    // configure with external settings
-    prepareDAG(dag, null, appName);
-    return dag;
+    return populateDAGAndValidate(tb, appName);
   }
 
   public LogicalPlan createEmptyForRecovery(String appName)
   {
     // build DAG from properties
     LogicalPlanConfiguration tb = new LogicalPlanConfiguration(new Configuration(false));
+    return populateDAGAndValidate(tb, appName);
+  }
+
+  public LogicalPlan createFromStreamingApplication(StreamingApplication app, String appName)
+  {
     LogicalPlan dag = new LogicalPlan();
-    tb.populateDAG(dag);
-    // configure with embedded settings
-    tb.prepareDAG(dag, null, appName);
-    // configure with external settings
-    prepareDAG(dag, null, appName);
+    pluginManager.setup(dag);
+    prepareDAG(dag, app, appName);
+    pluginManager.dispatch(PRE_VALIDATE_DAG.event);
+    dag.validate();
+    pluginManager.dispatch(POST_VALIDATE_DAG.event);
+    pluginManager.teardown();
     return dag;
   }
 
@@ -2186,7 +2219,6 @@ public class LogicalPlanConfiguration
         }
       }
     }
-
   }
 
   private GenericOperator addOperator(LogicalPlan dag, String name, GenericOperator operator)
@@ -2213,18 +2245,21 @@ public class LogicalPlanConfiguration
   /**
    * Populate the logical plan from the streaming application definition and configuration.
    * Configuration is resolved based on application alias, if any.
-   * @param app The {@lin StreamingApplication} to be run.
+   * @param app The {@link StreamingApplication} to be run.
    * @param dag This will hold the {@link LogicalPlan} representation of the given {@link StreamingApplication}.
    * @param name The path of the application class in the jar.
    */
   public void prepareDAG(LogicalPlan dag, StreamingApplication app, String name)
   {
-    // EVENTUALLY to be replaced by variable enabled configuration in the demo where the attribute below is used
-    String connectAddress = conf.get(StreamingApplication.DT_PREFIX + Context.DAGContext.GATEWAY_CONNECT_ADDRESS.getName());
-    dag.setAttribute(Context.DAGContext.GATEWAY_CONNECT_ADDRESS, connectAddress == null ? conf.get(GATEWAY_LISTEN_ADDRESS) : connectAddress);
+    prepareDAGAttributes(dag);
+
+    pluginManager.setup(dag);
     if (app != null) {
+      pluginManager.dispatch(PRE_POPULATE_DAG.event);
       app.populateDAG(dag, conf);
+      pluginManager.dispatch(POST_POPULATE_DAG.event);
     }
+    pluginManager.dispatch(PRE_CONFIGURE_DAG.event);
     String appAlias = getAppAlias(name);
     String appName = appAlias == null ? name : appAlias;
     List<AppConf> appConfs = stramConf.getMatchingChildConf(appName, StramElement.APPLICATION);
@@ -2240,6 +2275,27 @@ public class LogicalPlanConfiguration
     // inject external operator configuration
     setOperatorConfiguration(dag, appConfs, appName);
     setStreamConfiguration(dag, appConfs, appName);
+    pluginManager.dispatch(POST_CONFIGURE_DAG.event);
+    pluginManager.teardown();
+  }
+
+  private void prepareDAGAttributes(LogicalPlan dag)
+  {
+    // Consider making all attributes available for DAG construction
+    // EVENTUALLY to be replaced by variable enabled configuration in the demo where the attribute below is used
+    String connectAddress = conf.get(KEY_GATEWAY_CONNECT_ADDRESS);
+    dag.setAttribute(DAGContext.GATEWAY_CONNECT_ADDRESS, connectAddress == null ? conf.get(GATEWAY_LISTEN_ADDRESS) : connectAddress);
+    if (conf.getBoolean(KEY_GATEWAY_USE_SSL, DAGContext.GATEWAY_USE_SSL.defaultValue)) {
+      dag.setAttribute(DAGContext.GATEWAY_USE_SSL, true);
+    }
+    String username = conf.get(KEY_GATEWAY_USER_NAME);
+    if (username != null) {
+      dag.setAttribute(DAGContext.GATEWAY_USER_NAME, username);
+    }
+    String password = conf.get(KEY_GATEWAY_PASSWORD);
+    if (password != null) {
+      dag.setAttribute(DAGContext.GATEWAY_PASSWORD, password);
+    }
   }
 
   private void flattenDAG(LogicalPlan dag, Configuration conf)

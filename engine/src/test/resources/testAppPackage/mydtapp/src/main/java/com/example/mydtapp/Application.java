@@ -20,12 +20,13 @@ package com.example.mydtapp;
 
 import org.apache.hadoop.conf.Configuration;
 
+import com.datatorrent.api.Module;
 import com.datatorrent.api.annotation.ApplicationAnnotation;
 import com.datatorrent.api.StreamingApplication;
 import com.datatorrent.api.DAG;
 import com.datatorrent.api.DAG.Locality;
 
-@ApplicationAnnotation(name="MyFirstApplication")
+@ApplicationAnnotation(name = "MyFirstApplication")
 public class Application implements StreamingApplication
 {
 
@@ -37,7 +38,8 @@ public class Application implements StreamingApplication
 
     RandomNumberGenerator rand = dag.addOperator("rand", RandomNumberGenerator.class);
     StdoutOperator stdout = dag.addOperator("stdout", new StdoutOperator());
-
+    // This module will be added to dag for testing purpose but will not be connected in a dag.
+    Module testModule = dag.addModule("testModule", com.example.mydtapp.TestModule.class);
     dag.addStream("data", rand.out, stdout.in).setLocality(Locality.CONTAINER_LOCAL);
   }
 }

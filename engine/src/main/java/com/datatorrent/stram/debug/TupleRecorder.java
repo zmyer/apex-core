@@ -32,8 +32,11 @@ import java.util.Map;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeoutException;
 
+import org.codehaus.jackson.JsonProcessingException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import org.apache.apex.common.util.PropertiesHelper;
 
 import com.datatorrent.api.Operator;
 import com.datatorrent.api.Sink;
@@ -59,7 +62,7 @@ import com.datatorrent.stram.util.SharedPubSubWebSocketClient.Handler;
 public class TupleRecorder
 {
   public static final String VERSION = "1.2";
-  private int totalTupleCount = 0;
+  private long totalTupleCount = 0;
   private final HashMap<String, PortInfo> portMap = new HashMap<>(); // used for output portInfo <name, id> map
   private final HashMap<String, PortCount> portCountMap = new HashMap<>(); // used for tupleCount of each port <name, count> map
   private transient long currentWindowId = WindowGenerator.MIN_WINDOW_ID - 1;
@@ -76,6 +79,15 @@ public class TupleRecorder
   private String recordingNameTopic;
   private long numWindows = Long.MAX_VALUE; // number of windows to record
   private Runnable stopProcedure; // stop procedure to execute
+
+  private static final Logger logger = LoggerFactory.getLogger(TupleRecorder.class);
+
+  // If there are errors processing tuples, don't log an error for every tuple as it could overwhelm the logs.
+  // The property specifies the minumum number of tuples between two consecutive error log statements. Set it to zero to
+  // log every tuple error
+  private static long ERROR_LOG_GAP = PropertiesHelper.getLong("org.apache.apex.stram.tupleRecorder.errorLogGap", 10000L, 0, Long.MAX_VALUE);
+  long lastLog = -1;
+
   private final FSPartFileCollection storage = new FSPartFileCollection()
   {
     @Override
@@ -154,7 +166,7 @@ public class TupleRecorder
     return Collections.unmodifiableMap(portMap);
   }
 
-  public int getTotalTupleCount()
+  public long getTotalTupleCount()
   {
     return totalTupleCount;
   }
@@ -392,12 +404,19 @@ public class TupleRecorder
 
   public void writeTuple(Object obj, String port)
   {
+    ++totalTupleCount;
     if (windowIdRanges.isEmpty()) {
       throw new RuntimeException("Data tuples received from tuple recorder before any BEGIN_WINDOW");
     }
+    ByteArrayOutputStream bos = new ByteArrayOutputStream();
+    Slice f = null;
     try {
-      ByteArrayOutputStream bos = new ByteArrayOutputStream();
-      Slice f = streamCodec.toByteArray(obj);
+      f = streamCodec.toByteArray(obj);
+    } catch (RuntimeException ex) {
+      checkLogTuple(ex, "save", obj);
+      return;
+    }
+    try {
       PortInfo pi = portMap.get(port);
       String str = "T:" + System.currentTimeMillis() + ":" + pi.id + ":" + f.length + ":";
       bos.write(str.getBytes());
@@ -410,13 +429,12 @@ public class TupleRecorder
       storage.writeDataItem(bos.toByteArray(), true);
       //logger.debug("Writing tuple for port id {}", pi.id);
       //fsOutput.hflush();
-      ++totalTupleCount;
       if (numSubscribers > 0) {
         // this is not asynchronous.  we need to fix this
         publishTupleData(pi.id, obj);
       }
-    } catch (IOException ex) {
-      logger.error(ex.toString());
+    } catch (Exception ex) {
+      logger.warn("Error saving tuple", ex);
     }
   }
 
@@ -463,7 +481,19 @@ public class TupleRecorder
         wsClient.publish(recordingNameTopic, map);
       }
     } catch (Exception ex) {
-      logger.warn("Error publishing tuple data", ex);
+      if (ex instanceof JsonProcessingException) {
+        checkLogTuple(ex, "publish", obj);
+      } else {
+        logger.warn("Error publishing tuple", ex);
+      }
+    }
+  }
+
+  private void checkLogTuple(Exception ex, String context, Object tuple)
+  {
+    if ((lastLog == -1) || (totalTupleCount - lastLog) >= ERROR_LOG_GAP) {
+      lastLog = totalTupleCount;
+      logger.warn("Error serializing during {} for tuple {} ", context, tuple, ex);
     }
   }
 
@@ -519,5 +549,4 @@ public class TupleRecorder
 
   }
 
-  private static final Logger logger = LoggerFactory.getLogger(TupleRecorder.class);
 }

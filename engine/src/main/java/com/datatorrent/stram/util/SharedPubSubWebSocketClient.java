@@ -51,12 +51,17 @@ public class SharedPubSubWebSocketClient extends PubSubWebSocketClient
 
   public interface Handler
   {
-    public void onMessage(String type, String topic, Object data);
+    void onMessage(String type, String topic, Object data);
 
-    public void onClose();
+    void onClose();
 
   }
 
+  /**
+   * Construct a SharedPubSubWebSocketClient with the given parameters
+   * @param uri The web socket server uri
+   * @param timeoutMillis The connection timeout
+   */
   public SharedPubSubWebSocketClient(URI uri, long timeoutMillis)
   {
     this.setUri(uri);
@@ -64,14 +69,21 @@ public class SharedPubSubWebSocketClient extends PubSubWebSocketClient
     this.timeoutMillis = timeoutMillis;
   }
 
+  /**
+   * Construct a SharedPubSubWebSocketClient with the given parameters
+   * @param uri The web socket server uri as string
+   * @param timeoutMillis The connection timeout
+   */
   public SharedPubSubWebSocketClient(String uri, long timeoutMillis) throws URISyntaxException
   {
     this(new URI(uri), timeoutMillis);
   }
 
-  public void setup() throws IOException, ExecutionException, InterruptedException, TimeoutException
+  public synchronized void openConnection() throws IOException, ExecutionException, InterruptedException, TimeoutException
   {
-    openConnection(timeoutMillis);
+    if (!isConnectionSetup()) {
+      super.openConnection(timeoutMillis);
+    }
   }
 
   public synchronized void addHandler(String topic, boolean numSubscribers, Handler handler)

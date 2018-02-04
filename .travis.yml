@@ -15,7 +15,10 @@
 
 language: java
 
-script: mvn apache-rat:check verify -Dlicense.skip=false -Dtravis=true
+jdk:
+  - openjdk7
+
+script: mvn apache-rat:check verify -Dlicense.skip=false -Dtravis=true && mvn dependency-check:check -Ddependency.check.showSummary=false
 
 notifications:
   slack:

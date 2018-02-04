@@ -44,7 +44,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.apex.common.util.JarHelper;
-import org.apache.commons.lang.StringUtils;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.yarn.api.ApplicationMasterProtocol;
 import org.apache.hadoop.yarn.api.protocolrecords.AllocateRequest;
@@ -64,6 +63,7 @@ import org.apache.hadoop.yarn.api.records.ResourceRequest;
 import org.apache.hadoop.yarn.client.api.AMRMClient;
 import org.apache.hadoop.yarn.client.api.AMRMClient.ContainerRequest;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
+import org.apache.hadoop.yarn.exceptions.YarnException;
 import org.apache.hadoop.yarn.server.MiniYARNCluster;
 import org.apache.hadoop.yarn.server.resourcemanager.ClientRMService;
 import org.apache.hadoop.yarn.util.Records;
@@ -91,6 +91,7 @@ import com.datatorrent.stram.webapp.StramWebServices;
 
 import static java.lang.Thread.sleep;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.fail;
 
 /**
  * The purpose of this test is to verify basic streaming application deployment
@@ -125,19 +126,12 @@ public class StramMiniClusterTest
     conf = StramClientUtils.addDTDefaultResources(conf);
     conf.setInt(YarnConfiguration.RM_SCHEDULER_MINIMUM_ALLOCATION_MB, 64);
     conf.setInt("yarn.nodemanager.vmem-pmem-ratio", 20); // workaround to avoid containers being killed because java allocated too much vmem
-    conf.setStrings("yarn.scheduler.capacity.root.queues", "default");
-    conf.setStrings("yarn.scheduler.capacity.root.default.capacity", "100");
-
-    StringBuilder adminEnv = new StringBuilder(1024);
-    if (System.getenv("JAVA_HOME") == null) {
-      adminEnv.append("JAVA_HOME=").append(System.getProperty("java.home"));
-      adminEnv.append(",");
-    }
-    adminEnv.append("MALLOC_ARENA_MAX=4"); // see MAPREDUCE-3068, MAPREDUCE-3065
-    adminEnv.append(",");
-    adminEnv.append("CLASSPATH=").append(getTestRuntimeClasspath());
-
-    conf.set(YarnConfiguration.NM_ADMIN_USER_ENV, adminEnv.toString());
+    conf.set("yarn.scheduler.capacity.root.queues", "default");
+    conf.set("yarn.scheduler.capacity.root.default.capacity", "100");
+    conf.setBoolean(YarnConfiguration.NM_DISK_HEALTH_CHECK_ENABLE, false);
+    conf.setFloat(YarnConfiguration.NM_MAX_PER_DISK_UTILIZATION_PERCENTAGE, 100.0F);
+    conf.set(YarnConfiguration.NM_ADMIN_USER_ENV, String.format("JAVA_HOME=%s,CLASSPATH=%s", System.getProperty("java.home"), getTestRuntimeClasspath()));
+    conf.set(YarnConfiguration.NM_ENV_WHITELIST, YarnConfiguration.DEFAULT_NM_ENV_WHITELIST.replaceAll("JAVA_HOME,*", ""));
 
     if (yarnCluster == null) {
       yarnCluster = new MiniYARNCluster(StramMiniClusterTest.class.getName(),
@@ -175,22 +169,26 @@ public class StramMiniClusterTest
     }
   }
 
-  @Test
-  public void testSetupShutdown() throws Exception
+  private void checkNodeState() throws YarnException
   {
-    GetClusterNodesRequest request =
-        Records.newRecord(GetClusterNodesRequest.class);
+    GetClusterNodesRequest request = Records.newRecord(GetClusterNodesRequest.class);
     ClientRMService clientRMService = yarnCluster.getResourceManager().getClientRMService();
     GetClusterNodesResponse response = clientRMService.getClusterNodes(request);
     List<NodeReport> nodeReports = response.getNodeReports();
     LOG.info("{}", nodeReports);
 
     for (NodeReport nr: nodeReports) {
-      LOG.info("Node: {}", nr.getNodeId());
-      LOG.info("Total memory: {}", nr.getCapability());
-      LOG.info("Used memory: {}", nr.getUsed());
-      LOG.info("Number containers: {}", nr.getNumContainers());
+      if (!nr.getNodeState().isUnusable()) {
+        return;
+      }
     }
+    fail("Yarn Mini cluster should have at least one usable node.");
+  }
+
+  @Test
+  public void testSetupShutdown() throws Exception
+  {
+    checkNodeState();
 
     JarHelper jarHelper = new JarHelper();
     LOG.info("engine jar: {}", jarHelper.getJar(StreamingAppMaster.class));
@@ -200,31 +198,25 @@ public class StramMiniClusterTest
     Properties dagProps = new Properties();
 
     // input module (ensure shutdown works while windows are generated)
-    dagProps.put(StreamingApplication.DT_PREFIX + "operator.numGen.classname", TestGeneratorInputOperator.class.getName());
-    dagProps.put(StreamingApplication.DT_PREFIX + "operator.numGen.maxTuples", "1");
+    dagProps.put(StreamingApplication.APEX_PREFIX + "operator.numGen.classname", TestGeneratorInputOperator.class.getName());
+    dagProps.put(StreamingApplication.APEX_PREFIX + "operator.numGen.maxTuples", "1");
 
-    // fake output adapter - to be ignored when determine shutdown
-    //props.put(DAGContext.DT_PREFIX + "stream.output.classname", HDFSOutputStream.class.getName());
-    //props.put(DAGContext.DT_PREFIX + "stream.output.inputNode", "module2");
-    //props.put(DAGContext.DT_PREFIX + "stream.output.filepath", "miniclustertest-testSetupShutdown.out");
+    dagProps.put(StreamingApplication.APEX_PREFIX + "operator.module1.classname", GenericTestOperator.class.getName());
 
-    dagProps.put(StreamingApplication.DT_PREFIX + "operator.module1.classname", GenericTestOperator.class.getName());
+    dagProps.put(StreamingApplication.APEX_PREFIX + "operator.module2.classname", GenericTestOperator.class.getName());
 
-    dagProps.put(StreamingApplication.DT_PREFIX + "operator.module2.classname", GenericTestOperator.class.getName());
+    dagProps.put(StreamingApplication.APEX_PREFIX + "stream.fromNumGen.source", "numGen.outport");
+    dagProps.put(StreamingApplication.APEX_PREFIX + "stream.fromNumGen.sinks", "module1.inport1");
 
-    dagProps.put(StreamingApplication.DT_PREFIX + "stream.fromNumGen.source", "numGen.outport");
-    dagProps.put(StreamingApplication.DT_PREFIX + "stream.fromNumGen.sinks", "module1.inport1");
+    dagProps.put(StreamingApplication.APEX_PREFIX + "stream.n1n2.source", "module1.outport1");
+    dagProps.put(StreamingApplication.APEX_PREFIX + "stream.n1n2.sinks", "module2.inport1");
 
-    dagProps.put(StreamingApplication.DT_PREFIX + "stream.n1n2.source", "module1.outport1");
-    dagProps.put(StreamingApplication.DT_PREFIX + "stream.n1n2.sinks", "module2.inport1");
-
-    dagProps.setProperty(StreamingApplication.DT_PREFIX + LogicalPlan.MASTER_MEMORY_MB.getName(), "128");
-    dagProps.setProperty(StreamingApplication.DT_PREFIX + LogicalPlan.CONTAINER_JVM_OPTIONS.getName(), "-Dlog4j.properties=custom_log4j.properties");
-    dagProps.setProperty(StreamingApplication.DT_PREFIX + "operator.*." + OperatorContext.MEMORY_MB.getName(), "64");
-    dagProps.setProperty(StreamingApplication.DT_PREFIX + "operator.*." + OperatorContext.VCORES.getName(), "1");
-    dagProps.setProperty(StreamingApplication.DT_PREFIX + "operator.*.port.*." + Context.PortContext.BUFFER_MEMORY_MB.getName(), "32");
-    dagProps.setProperty(StreamingApplication.DT_PREFIX + LogicalPlan.DEBUG.getName(), "true");
-    //dagProps.setProperty(StreamingApplication.DT_PREFIX + LogicalPlan.CONTAINERS_MAX_COUNT.getName(), "2");
+    dagProps.setProperty(StreamingApplication.APEX_PREFIX + LogicalPlan.MASTER_MEMORY_MB.getName(), "128");
+    dagProps.setProperty(StreamingApplication.APEX_PREFIX + LogicalPlan.CONTAINER_JVM_OPTIONS.getName(), "-Dlog4j.properties=custom_log4j.properties");
+    dagProps.setProperty(StreamingApplication.APEX_PREFIX + "operator.*." + OperatorContext.MEMORY_MB.getName(), "64");
+    dagProps.setProperty(StreamingApplication.APEX_PREFIX + "operator.*." + OperatorContext.VCORES.getName(), "1");
+    dagProps.setProperty(StreamingApplication.APEX_PREFIX + "operator.*.port.*." + Context.PortContext.BUFFER_MEMORY_MB.getName(), "32");
+    dagProps.setProperty(StreamingApplication.APEX_PREFIX + LogicalPlan.DEBUG.getName(), "true");
     LOG.info("dag properties: {}", dagProps);
 
     LOG.info("Initializing Client");
@@ -235,9 +227,6 @@ public class StramMiniClusterTest
     StramClient client = new StramClient(yarnConf, dag);
     try {
       client.start();
-      if (StringUtils.isBlank(System.getenv("JAVA_HOME"))) {
-        client.javaCmd = "java"; // JAVA_HOME not set in the yarn mini cluster
-      }
       LOG.info("Running client");
       client.startApplication();
       boolean result = client.monitorApplication();
@@ -272,18 +261,15 @@ public class StramMiniClusterTest
 
     // single container topology of inline input and module
     Properties props = new Properties();
-    props.put(StreamingApplication.DT_PREFIX + "stream.input.classname", TestGeneratorInputOperator.class.getName());
-    props.put(StreamingApplication.DT_PREFIX + "stream.input.outputNode", "module1");
-    props.put(StreamingApplication.DT_PREFIX + "module.module1.classname", GenericTestOperator.class.getName());
+    props.put(StreamingApplication.APEX_PREFIX + "stream.input.classname", TestGeneratorInputOperator.class.getName());
+    props.put(StreamingApplication.APEX_PREFIX + "stream.input.outputNode", "module1");
+    props.put(StreamingApplication.APEX_PREFIX + "module.module1.classname", GenericTestOperator.class.getName());
 
     LOG.info("Initializing Client");
     LogicalPlanConfiguration tb = new LogicalPlanConfiguration(new Configuration(false));
     tb.addFromProperties(props, null);
 
     StramClient client = new StramClient(new Configuration(yarnCluster.getConfig()), createDAG(tb));
-    if (StringUtils.isBlank(System.getenv("JAVA_HOME"))) {
-      client.javaCmd = "java"; // JAVA_HOME not set in the yarn mini cluster
-    }
     try {
       client.start();
       client.startApplication();
@@ -388,9 +374,6 @@ public class StramMiniClusterTest
 
     LOG.info("Initializing Client");
     StramClient client = new StramClient(conf, dag);
-    if (StringUtils.isBlank(System.getenv("JAVA_HOME"))) {
-      client.javaCmd = "java"; // JAVA_HOME not set in the yarn mini cluster
-    }
     try {
       client.start();
       client.startApplication();
@@ -609,4 +592,33 @@ public class StramMiniClusterTest
 
   }
 
+  private static String APP_NAME = "$test\\\"'";
+
+  @Test
+  public void testAddAttributeToArgs() throws Exception
+  {
+    LogicalPlan dag = new LogicalPlan();
+    dag.setAttribute(LogicalPlan.APPLICATION_NAME, APP_NAME);
+    AddAttributeToArgsOperator operator = dag.addOperator("test", AddAttributeToArgsOperator.class);
+    dag.getContextAttributes(operator).put(OperatorContext.RECOVERY_ATTEMPTS, 0);
+
+    StramClient client = new StramClient(conf, dag);
+    try {
+      client.start();
+      client.startApplication();
+      Assert.assertTrue(client.monitorApplication());
+    } finally {
+      client.stop();
+    }
+  }
+
+  public static class AddAttributeToArgsOperator extends BaseOperator implements InputOperator
+  {
+    @Override
+    public void emitTuples()
+    {
+      throw APP_NAME.equals(System.getProperty(LogicalPlan.APPLICATION_NAME.getLongName()))
+          ? new ShutdownException() : new RuntimeException();
+    }
+  }
 }

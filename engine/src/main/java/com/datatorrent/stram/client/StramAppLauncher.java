@@ -106,6 +106,9 @@ public class StramAppLauncher
   private LinkedHashSet<File> deployJars;
   private final StringWriter mvnBuildClasspathOutput = new StringWriter();
 
+  private ClassLoader initialClassLoader;
+  private Thread loaderThread;
+
   public interface AppFactory
   {
     LogicalPlan createApp(LogicalPlanConfiguration conf);
@@ -220,7 +223,6 @@ public class StramAppLauncher
     }
   }
 
-
   public StramAppLauncher(File appJarFile, Configuration conf) throws Exception
   {
     this.jarFile = appJarFile;
@@ -273,7 +275,7 @@ public class StramAppLauncher
     if (originalAppId == null) {
       throw new AssertionError("Need original app id if launching without apa or appjar");
     }
-    Path appsBasePath = new Path(StramClientUtils.getDTDFSRootDir(fs, conf), StramClientUtils.SUBDIR_APPS);
+    Path appsBasePath = new Path(StramClientUtils.getApexDFSRootDir(fs, conf), StramClientUtils.SUBDIR_APPS);
     Path origAppPath = new Path(appsBasePath, originalAppId);
     StringWriter writer = new StringWriter();
     try (FSDataInputStream in = fs.open(new Path(origAppPath, "meta.json"))) {
@@ -535,22 +537,44 @@ public class StramAppLauncher
 
   public URLClassLoader loadDependencies()
   {
-    URLClassLoader cl = URLClassLoader.newInstance(launchDependencies.toArray(new URL[launchDependencies.size()]));
-    Thread.currentThread().setContextClassLoader(cl);
-    StringCodecs.check();
-    return cl;
+    if (this.loaderThread == null && this.initialClassLoader == null) {
+      this.loaderThread = Thread.currentThread();
+      this.initialClassLoader = Thread.currentThread().getContextClassLoader();
+    }
+
+    if (Thread.currentThread() != this.loaderThread) {
+      throw new RuntimeException("Calls to loadDependencies can only be made on the same thread that loadDependencies was called on for the first time");
+    } else {
+      URL[] dependencies = launchDependencies.toArray(new URL[launchDependencies.size()]);
+
+      ClassLoader currentContextClassLoader = Thread.currentThread().getContextClassLoader();
+      URLClassLoader cl = URLClassLoader.newInstance(dependencies, currentContextClassLoader);
+      Thread.currentThread().setContextClassLoader(cl);
+
+      StringCodecs.check();
+      return cl;
+    }
+  }
+
+  public void resetContextClassLoader()
+  {
+    if (Thread.currentThread() != this.loaderThread) {
+      throw new RuntimeException("Calls to resetContextClassLoader can only be made on the same thread that loadDependencies was called on for the first time");
+    }
+
+    Thread.currentThread().setContextClassLoader(initialClassLoader);
   }
 
   private void setTokenRefreshCredentials(LogicalPlan dag, Configuration conf) throws IOException
   {
-    String principal = StramUserLogin.getPrincipal();
-    String keytabPath = conf.get(StramClientUtils.KEY_TAB_FILE);
+    String principal = conf.get(StramClientUtils.TOKEN_REFRESH_PRINCIPAL, StramUserLogin.getPrincipal());
+    String keytabPath = conf.get(StramClientUtils.TOKEN_REFRESH_KEYTAB, conf.get(StramClientUtils.KEY_TAB_FILE));
     if (keytabPath == null) {
       String keytab = StramUserLogin.getKeytab();
       if (keytab != null) {
         Path localKeyTabPath = new Path(keytab);
         try (FileSystem fs = StramClientUtils.newFileSystemInstance(conf)) {
-          Path destPath = new Path(StramClientUtils.getDTDFSRootDir(fs, conf), localKeyTabPath.getName());
+          Path destPath = new Path(StramClientUtils.getApexDFSRootDir(fs, conf), localKeyTabPath.getName());
           if (!fs.exists(destPath)) {
             fs.copyFromLocalFile(false, false, localKeyTabPath, destPath);
           }
@@ -558,6 +582,7 @@ public class StramAppLauncher
         }
       }
     }
+    LOG.debug("User principal is {}, keytab is {}", principal, keytabPath);
     if ((principal != null) && (keytabPath != null)) {
       dag.setAttribute(LogicalPlan.PRINCIPAL, principal);
       dag.setAttribute(LogicalPlan.KEY_TAB_FILE, keytabPath);

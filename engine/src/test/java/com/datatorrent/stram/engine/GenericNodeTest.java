@@ -23,7 +23,6 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -39,7 +38,6 @@ import org.apache.commons.io.FileUtils;
 import org.apache.hadoop.conf.Configuration;
 
 import com.google.common.collect.Lists;
-import com.google.common.collect.Sets;
 
 import com.datatorrent.api.Attribute.AttributeMap;
 import com.datatorrent.api.Attribute.AttributeMap.DefaultAttributeMap;
@@ -47,7 +45,6 @@ import com.datatorrent.api.Context;
 import com.datatorrent.api.DefaultInputPort;
 import com.datatorrent.api.DefaultOutputPort;
 import com.datatorrent.api.Operator;
-import com.datatorrent.api.Operator.CheckpointNotificationListener;
 import com.datatorrent.api.Operator.ProcessingMode;
 import com.datatorrent.api.Sink;
 import com.datatorrent.api.Stats.OperatorStats;
@@ -62,10 +59,13 @@ import com.datatorrent.common.util.ScheduledExecutorService;
 import com.datatorrent.common.util.ScheduledThreadPoolExecutor;
 import com.datatorrent.netlet.DefaultEventLoop;
 import com.datatorrent.netlet.EventLoop;
+import com.datatorrent.stram.CustomControlTupleTest;
 import com.datatorrent.stram.api.Checkpoint;
 import com.datatorrent.stram.codec.DefaultStatefulStreamCodec;
 import com.datatorrent.stram.stream.BufferServerPublisher;
 import com.datatorrent.stram.stream.BufferServerSubscriber;
+import com.datatorrent.stram.stream.OiOStream;
+import com.datatorrent.stram.tuple.CustomControlTuple;
 import com.datatorrent.stram.tuple.EndStreamTuple;
 import com.datatorrent.stram.tuple.EndWindowTuple;
 import com.datatorrent.stram.tuple.Tuple;
@@ -197,7 +197,7 @@ public class GenericNodeTest
 
     };
     @OutputPortFieldAnnotation( optional = true)
-    DefaultOutputPort<Object> op = new DefaultOutputPort<Object>();
+    DefaultOutputPort<Object> op = new DefaultOutputPort<>();
 
     @Override
     public void beginWindow(long windowId)
@@ -226,7 +226,7 @@ public class GenericNodeTest
 
   public static class CheckpointDistanceOperator extends GenericOperator
   {
-    List<Integer> distances = new ArrayList<Integer>();
+    List<Integer> distances = new ArrayList<>();
     int numWindows = 0;
     int maxWindows = 0;
 
@@ -240,52 +240,12 @@ public class GenericNodeTest
     }
   }
 
-  public static class GenericCheckpointOperator extends GenericOperator implements CheckpointNotificationListener
-  {
-    public Set<Long> checkpointedWindows = Sets.newHashSet();
-    public volatile boolean checkpointTwice = false;
-    public volatile int numWindows = 0;
-
-    public GenericCheckpointOperator()
-    {
-    }
-
-    @Override
-    public void beginWindow(long windowId)
-    {
-      super.beginWindow(windowId);
-    }
-
-    @Override
-    public void endWindow()
-    {
-      super.endWindow();
-      numWindows++;
-    }
-
-    @Override
-    public void checkpointed(long windowId)
-    {
-      checkpointTwice = checkpointTwice || !checkpointedWindows.add(windowId);
-    }
-
-    @Override
-    public void committed(long windowId)
-    {
-    }
-
-    @Override
-    public void beforeCheckpoint(long windowId)
-    {
-    }
-  }
-
   @Test
   @SuppressWarnings("SleepWhileInLoop")
   public void testSynchingLogic() throws InterruptedException
   {
     long sleeptime = 25L;
-    final ArrayList<Object> list = new ArrayList<Object>();
+    final ArrayList<Object> list = new ArrayList<>();
     GenericOperator go = new GenericOperator();
     final GenericNode gn = new GenericNode(go, new com.datatorrent.stram.engine.OperatorContext(0, "operator",
         new DefaultAttributeMap(), null));
@@ -413,11 +373,11 @@ public class GenericNodeTest
     EventLoop eventloop = DefaultEventLoop.createEventLoop("StreamTestEventLoop");
 
     ((DefaultEventLoop)eventloop).start();
-    final Server bufferServer = new Server(0); // find random port
-    final int bufferServerPort = bufferServer.run(eventloop).getPort();
+    final Server bufferServer = new Server(eventloop, 0); // find random port
+    final int bufferServerPort = bufferServer.run().getPort();
 
-    final StreamCodec<Object> serde = new DefaultStatefulStreamCodec<Object>();
-    final BlockingQueue<Object> tuples = new ArrayBlockingQueue<Object>(10);
+    final StreamCodec<Object> serde = new DefaultStatefulStreamCodec<>();
+    final BlockingQueue<Object> tuples = new ArrayBlockingQueue<>(10);
 
     GenericTestOperator go = new GenericTestOperator();
     final GenericNode gn = new GenericNode(go, new com.datatorrent.stram.engine.OperatorContext(0, "operator",
@@ -518,7 +478,7 @@ public class GenericNodeTest
     Assert.assertEquals("Payload Tuple 3", 3, ((byte[])list.get(7))[5]);
 
     if (bufferServer != null) {
-      eventloop.stop(bufferServer);
+      bufferServer.stop();
     }
 
     ((DefaultEventLoop)eventloop).stop();
@@ -606,6 +566,195 @@ public class GenericNodeTest
     t.join();
 
     Assert.assertTrue("End window not called", go.endWindowId != go.beginWindowId);
+  }
+
+  @Test
+  public void testControlTuplesDeliveryGenericNode() throws InterruptedException
+  {
+    long maxSleep = 5000000;
+    long sleeptime = 25L;
+    GenericOperator go = new GenericOperator();
+    final GenericNode gn = new GenericNode(go, new com.datatorrent.stram.engine.OperatorContext(0, "operator",
+        new DefaultAttributeMap(), null));
+    gn.setId(1);
+    AbstractReservoir reservoir1 = AbstractReservoir.newReservoir("ip1Res", 1024);
+
+    gn.connectInputPort("ip1", reservoir1);
+    TestSink testSink = new TestSink();
+    gn.connectOutputPort("op", testSink);
+    gn.firstWindowMillis = 0;
+    gn.windowWidthMillis = 100;
+
+    final AtomicBoolean ab = new AtomicBoolean(false);
+    Thread t = new Thread()
+    {
+      @Override
+      public void run()
+      {
+        ab.set(true);
+        gn.activate();
+        gn.run();
+        gn.deactivate();
+      }
+    };
+    t.start();
+
+    long interval = 0;
+    do {
+      Thread.sleep(sleeptime);
+      interval += sleeptime;
+    } while ((ab.get() == false) && (interval < maxSleep));
+
+    int controlTupleCount = gn.controlTupleCount;
+    Tuple beginWindow = new Tuple(MessageType.BEGIN_WINDOW, 0x1L);
+    reservoir1.add(beginWindow);
+
+    interval = 0;
+    do {
+      Thread.sleep(sleeptime);
+      interval += sleeptime;
+    } while ((gn.controlTupleCount == controlTupleCount) && (interval < maxSleep));
+    controlTupleCount = gn.controlTupleCount;
+
+    CustomControlTuple t1 = new CustomControlTuple(new CustomControlTupleTest.TestControlTuple(1, false));
+    CustomControlTuple t2 = new CustomControlTuple(new CustomControlTupleTest.TestControlTuple(2, true));
+    CustomControlTuple t3 = new CustomControlTuple(new CustomControlTupleTest.TestControlTuple(3, false));
+    CustomControlTuple t4 = new CustomControlTuple(new CustomControlTupleTest.TestControlTuple(4, true));
+    reservoir1.add(t1);
+    reservoir1.add(t2);
+    reservoir1.add(t3);
+    reservoir1.add(t4);
+
+    interval = 0;
+    do {
+      Thread.sleep(sleeptime);
+      interval += sleeptime;
+    } while ((gn.controlTupleCount == controlTupleCount) && (interval < maxSleep));
+
+    Assert.assertTrue("Custom control tuples emitted immediately", testSink.getResultCount() == 3);
+
+    controlTupleCount = gn.controlTupleCount;
+    Tuple endWindow = new Tuple(MessageType.END_WINDOW, 0x1L);
+    reservoir1.add(endWindow);
+
+    interval = 0;
+    do {
+      Thread.sleep(sleeptime);
+      interval += sleeptime;
+    } while ((gn.controlTupleCount == controlTupleCount) && (interval < maxSleep));
+
+    gn.shutdown();
+    t.join();
+
+    Assert.assertTrue("Total control tuples", testSink.getResultCount() == 6);
+
+    long expected = 0;
+    for (Object o: testSink.collectedTuples) {
+      if (o instanceof CustomControlTuple) {
+        expected++;
+      }
+    }
+    Assert.assertTrue("Number of Custom control tuples", expected == 4);
+  }
+
+  @Test
+  public void testControlTuplesDeliveryOiONode() throws InterruptedException
+  {
+    GenericOperator go = new GenericOperator();
+    final OiONode oioNode = new OiONode(go, new com.datatorrent.stram.engine.OperatorContext(0, "operator",
+        new DefaultAttributeMap(), null));
+    oioNode.setId(1);
+
+    OiOStream stream = new OiOStream();
+    SweepableReservoir reservoir = stream.getReservoir();
+    ((OiOStream.OiOReservoir)reservoir).setControlSink((oioNode).getControlSink(reservoir));
+    oioNode.connectInputPort("ip1", reservoir);
+    Sink controlSink = oioNode.getControlSink(reservoir);
+
+    TestSink testSink = new TestSink();
+    oioNode.connectOutputPort("op", testSink);
+    oioNode.firstWindowMillis = 0;
+    oioNode.windowWidthMillis = 100;
+
+    oioNode.activate();
+
+    Tuple beginWindow = new Tuple(MessageType.BEGIN_WINDOW, 0x1L);
+    controlSink.put(beginWindow);
+    Assert.assertTrue("Begin window", testSink.getResultCount() == 1);
+
+    CustomControlTuple t1 = new CustomControlTuple(new CustomControlTupleTest.TestControlTuple(1, false));
+    CustomControlTuple t2 = new CustomControlTuple(new CustomControlTupleTest.TestControlTuple(2, true));
+    CustomControlTuple t3 = new CustomControlTuple(new CustomControlTupleTest.TestControlTuple(3, false));
+    CustomControlTuple t4 = new CustomControlTuple(new CustomControlTupleTest.TestControlTuple(4, true));
+    controlSink.put(t1);
+    controlSink.put(t2);
+    controlSink.put(t3);
+    controlSink.put(t4);
+    Assert.assertTrue("Custom control tuples emitted immediately", testSink.getResultCount() == 3);
+
+    Tuple endWindow = new Tuple(MessageType.END_WINDOW, 0x1L);
+    controlSink.put(endWindow);
+
+    oioNode.deactivate();
+    oioNode.shutdown();
+
+    Assert.assertTrue("Total control tuples", testSink.getResultCount() == 6);
+
+    long expected = 0;
+    for (Object o: testSink.collectedTuples) {
+      if (o instanceof CustomControlTuple) {
+        expected++;
+      }
+    }
+    Assert.assertTrue("Number of Custom control tuples", expected == 4);
+  }
+
+  @Test
+  public void testReservoirPortMapping() throws InterruptedException
+  {
+    long maxSleep = 5000;
+    long sleeptime = 25L;
+    GenericOperator go = new GenericOperator();
+    final GenericNode gn = new GenericNode(go, new com.datatorrent.stram.engine.OperatorContext(0, "operator",
+        new DefaultAttributeMap(), null));
+    gn.setId(1);
+    AbstractReservoir reservoir1 = AbstractReservoir.newReservoir("ip1Res", 1024);
+    AbstractReservoir reservoir2 = AbstractReservoir.newReservoir("ip2Res", 1024);
+
+    gn.connectInputPort("ip1", reservoir1);
+    gn.connectInputPort("ip2", reservoir2);
+    gn.connectOutputPort("op", Sink.BLACKHOLE);
+    gn.firstWindowMillis = 0;
+    gn.windowWidthMillis = 100;
+
+    final AtomicBoolean ab = new AtomicBoolean(false);
+    Thread t = new Thread()
+    {
+      @Override
+      public void run()
+      {
+        ab.set(true);
+        gn.activate();
+        gn.run();
+        gn.deactivate();
+      }
+    };
+    t.start();
+
+    long interval = 0;
+    do {
+      Thread.sleep(sleeptime);
+      interval += sleeptime;
+    } while ((ab.get() == false) && (interval < maxSleep));
+
+    gn.populateReservoirInputPortMap();
+
+    gn.shutdown();
+    t.join();
+
+    Assert.assertTrue("Port Mapping Size", gn.reservoirPortMap.size() == 2);
+    Assert.assertTrue("Sink 1 is not a port", gn.reservoirPortMap.get(reservoir1) instanceof Operator.InputPort);
+    Assert.assertTrue("Sink 2 is not a port", gn.reservoirPortMap.get(reservoir2) instanceof Operator.InputPort);
   }
 
   @Test
@@ -756,7 +905,7 @@ public class GenericNodeTest
     CheckpointDistanceOperator go = new CheckpointDistanceOperator();
     go.maxWindows = maxWindows;
 
-    List<Integer> checkpoints = new ArrayList<Integer>();
+    List<Integer> checkpoints = new ArrayList<>();
 
     int window = 0;
     while (window < maxWindows) {

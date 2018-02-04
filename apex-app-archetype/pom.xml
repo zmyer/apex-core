@@ -25,7 +25,7 @@
   <parent>
     <groupId>org.apache.apex</groupId>
     <artifactId>apex</artifactId>
-    <version>3.6.0-SNAPSHOT</version>
+    <version>3.7.0-SNAPSHOT</version>
   </parent>
 
   <artifactId>apex-app-archetype</artifactId>
@@ -50,5 +50,22 @@
         </plugin>
       </plugins>
     </pluginManagement>
+
+    <resources>
+      <resource>
+        <directory>src/main/resources</directory>
+        <filtering>true</filtering>
+        <includes>
+          <include>META-INF/maven/archetype-metadata.xml</include>
+        </includes>
+      </resource>
+      <resource>
+        <directory>src/main/resources</directory>
+        <filtering>false</filtering>
+        <excludes>
+          <exclude>META-INF/maven/archetype-metadata.xml</exclude>
+        </excludes>
+      </resource>
+    </resources>
   </build>
 </project>

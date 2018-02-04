@@ -23,6 +23,8 @@ import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.List;
 
+import org.apache.apex.log.LogFileInformation;
+
 import org.apache.commons.lang.builder.ToStringBuilder;
 import org.apache.commons.lang.builder.ToStringStyle;
 import org.apache.hadoop.classification.InterfaceAudience;
@@ -52,7 +54,7 @@ import com.datatorrent.stram.util.AbstractWritableAdapter;
 @InterfaceStability.Stable
 public interface StreamingContainerUmbilicalProtocol extends VersionedProtocol
 {
-  public static final long versionID = 201208081755L;
+  long versionID = 201208081755L;
 
   /**
    * Initialization parameters for StramChild container. Container
@@ -341,6 +343,24 @@ public interface StreamingContainerUmbilicalProtocol extends VersionedProtocol
     }
   }
 
+  enum ShutdownType
+  {
+    /**
+     * WAIT_TERMINATE, when this value is set all input operators in the
+     * container terminates and send END_STREAM tuple to downstream
+     * operators. This type of shutdown make sure that data emitted by upstream
+     * operator before shutdown are processed by downstreams operator before
+     * they terminate.
+     */
+    WAIT_TERMINATE,
+    /**
+     * ABORT, In few cases we need to shutdown container forcefully such
+     * as resource allocation timeout, stale container or container without any operator.
+     * In such cases this flag will be used to send shutdown request to the container.
+     */
+    ABORT,
+  }
+
   /**
    *
    * Response from the stram to the container heartbeat
@@ -354,7 +374,7 @@ public interface StreamingContainerUmbilicalProtocol extends VersionedProtocol
     /**
      * Indicate container to exit heartbeat loop and shutdown.
      */
-    public boolean shutdown;
+    public ShutdownType shutdown;
 
     /**
      * Optional list of responses for operators in the container.
@@ -412,8 +432,9 @@ public interface StreamingContainerUmbilicalProtocol extends VersionedProtocol
    * @param containerId
    * @param operators
    * @param msg
+   * @param logFileInfo
    */
-  void reportError(String containerId, int[] operators, String msg);
+  void reportError(String containerId, int[] operators, String msg, LogFileInformation logFileInfo) throws IOException;
 
   /**
    * To be called periodically by child for heartbeat protocol.
@@ -421,6 +442,6 @@ public interface StreamingContainerUmbilicalProtocol extends VersionedProtocol
    * @param msg
    * @return
    */
-  ContainerHeartbeatResponse processHeartbeat(ContainerHeartbeat msg);
+  ContainerHeartbeatResponse processHeartbeat(ContainerHeartbeat msg) throws IOException;
 
 }

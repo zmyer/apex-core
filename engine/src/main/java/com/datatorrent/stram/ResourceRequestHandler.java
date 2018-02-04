@@ -81,6 +81,7 @@ public class ResourceRequestHandler
          */
         if ((loopCounter - entry.getValue().getKey()) > NUMBER_MISSED_HEARTBEATS) {
           StreamingContainerAgent.ContainerStartRequest csr = entry.getKey();
+          LOG.debug("Request for container {} timed out. Re-requesting container", csr.container);
           removedContainerRequests.add(entry.getValue().getRight());
           ContainerRequest cr = resourceRequestor.createContainerRequest(csr, false);
           entry.getValue().setLeft(loopCounter);
@@ -101,7 +102,7 @@ public class ResourceRequestHandler
    */
   public void addContainerRequest(Map<StreamingContainerAgent.ContainerStartRequest, MutablePair<Integer, ContainerRequest>> requestedResources, int loopCounter, List<ContainerRequest> containerRequests, StreamingContainerAgent.ContainerStartRequest csr, ContainerRequest cr)
   {
-    MutablePair<Integer, ContainerRequest> pair = new MutablePair<Integer, ContainerRequest>(loopCounter, cr);
+    MutablePair<Integer, ContainerRequest> pair = new MutablePair<>(loopCounter, cr);
     requestedResources.put(csr, pair);
     containerRequests.add(cr);
   }
@@ -163,7 +164,7 @@ public class ResourceRequestHandler
 
   public List<String> getNodesExceptHost(List<String> hostNames)
   {
-    List<String> nodesList = new ArrayList<String>();
+    List<String> nodesList = new ArrayList<>();
     Set<String> hostNameSet = Sets.newHashSet();
     hostNameSet.addAll(hostNames);
     for (String host : nodeReportMap.keySet()) {

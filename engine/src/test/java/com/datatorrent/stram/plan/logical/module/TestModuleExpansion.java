@@ -59,7 +59,7 @@ public class TestModuleExpansion
     private int inputOperatorProp = 0;
 
     Random r = new Random();
-    public transient DefaultOutputPort<Integer> out = new DefaultOutputPort<Integer>();
+    public transient DefaultOutputPort<Integer> out = new DefaultOutputPort<>();
 
     @Override
     public void emitTuples()
@@ -459,7 +459,7 @@ public class TestModuleExpansion
 
     List<String> sinksName = new ArrayList<>();
     for (LogicalPlan.InputPortMeta inputPortMeta : streamMeta.getSinks()) {
-      sinksName.add(inputPortMeta.getOperatorWrapper().getName());
+      sinksName.add(inputPortMeta.getOperatorMeta().getName());
     }
 
     Assert.assertTrue(inputOperatorName.equals(sourceName));
@@ -709,7 +709,7 @@ public class TestModuleExpansion
     JSONObject json = new JSONObject(writer.toString());
 
     Configuration conf = new Configuration(false);
-    conf.set(StreamingApplication.DT_PREFIX + "operator.operator3.prop.myStringProperty", "o3StringFromConf");
+    conf.set(StreamingApplication.APEX_PREFIX + "operator.operator3.prop.myStringProperty", "o3StringFromConf");
 
     LogicalPlanConfiguration planConf = new LogicalPlanConfiguration(conf);
     LogicalPlan dag = planConf.createFromJson(json, "testLoadFromJson");

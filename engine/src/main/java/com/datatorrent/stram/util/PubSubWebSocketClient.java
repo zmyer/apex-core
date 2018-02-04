@@ -116,10 +116,10 @@ public abstract class PubSubWebSocketClient implements Component<Context>
    */
   public PubSubWebSocketClient()
   {
-    throwable = new AtomicReference<Throwable>();
+    throwable = new AtomicReference<>();
     ioThreadMultiplier = 1;
     mapper = (new JacksonObjectMapperProvider()).getContext(null);
-    codec = new PubSubMessageCodec<Object>(mapper);
+    codec = new PubSubMessageCodec<>(mapper);
 
     AsyncHttpClientConfigBean config = new AsyncHttpClientConfigBean();
     config.setIoThreadMultiplier(ioThreadMultiplier);
@@ -136,6 +136,11 @@ public abstract class PubSubWebSocketClient implements Component<Context>
   public void setUri(URI uri)
   {
     this.uri = uri;
+  }
+
+  public URI getUri()
+  {
+    return uri;
   }
 
   public void setIoThreadMultiplier(int ioThreadMultiplier)
@@ -239,17 +244,18 @@ public abstract class PubSubWebSocketClient implements Component<Context>
     }
   }
 
+  protected boolean isConnectionSetup()
+  {
+    return (connection != null);
+  }
+
   /**
    *
    * @return true if the connection is open; false otherwise.
    */
   public boolean isConnectionOpen()
   {
-    if (connection == null) {
-      return false;
-    }
-
-    return connection.isOpen();
+    return isConnectionSetup() ? connection.isOpen() : false;
   }
 
   /**

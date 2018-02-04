@@ -48,6 +48,7 @@ import com.datatorrent.api.DefaultPartition;
 import com.datatorrent.api.InputOperator;
 import com.datatorrent.api.Partitioner;
 import com.datatorrent.api.StatsListener;
+import com.datatorrent.api.StatsListener.StatsListenerWithContext;
 import com.datatorrent.api.annotation.OutputPortFieldAnnotation;
 import com.datatorrent.common.partitioner.StatelessPartitioner;
 import com.datatorrent.common.util.AsyncFSStorageAgent;
@@ -86,7 +87,7 @@ public class PartitioningTest
     /*
      * Received tuples are stored in a map keyed with the system assigned operator id.
      */
-    public static final ConcurrentHashMap<String, List<Object>> receivedTuples = new ConcurrentHashMap<String, List<Object>>();
+    public static final ConcurrentHashMap<String, List<Object>> receivedTuples = new ConcurrentHashMap<>();
     private transient int operatorId;
     public String prefix = "";
 
@@ -107,7 +108,7 @@ public class PartitioningTest
         synchronized (receivedTuples) {
           List<Object> l = receivedTuples.get(id);
           if (l == null) {
-            l = Collections.synchronizedList(new ArrayList<Object>());
+            l = Collections.synchronizedList(new ArrayList<>());
             //LOG.debug("adding {} {}", id, l);
             receivedTuples.put(id, l);
           }
@@ -121,12 +122,12 @@ public class PartitioningTest
 
     };
     @OutputPortFieldAnnotation( optional = true)
-    public final transient DefaultOutputPort<Object> output = new DefaultOutputPort<Object>();
+    public final transient DefaultOutputPort<Object> output = new DefaultOutputPort<>();
   }
 
   public static class TestInputOperator<T> extends BaseOperator implements InputOperator
   {
-    public final transient DefaultOutputPort<T> output = new DefaultOutputPort<T>();
+    public final transient DefaultOutputPort<T> output = new DefaultOutputPort<>();
     transient boolean first;
     transient long windowId;
     boolean blockEndStream = false;
@@ -178,9 +179,9 @@ public class PartitioningTest
     CollectorOperator.receivedTuples.clear();
 
     TestInputOperator<Integer> input = dag.addOperator("input", new TestInputOperator<Integer>());
-    input.testTuples = new ArrayList<List<Integer>>();
+    input.testTuples = new ArrayList<>();
     for (Integer[] tuples: testData) {
-      input.testTuples.add(new ArrayList<Integer>(Arrays.asList(tuples)));
+      input.testTuples.add(new ArrayList<>(Arrays.asList(tuples)));
     }
     CollectorOperator collector = dag.addOperator("collector", new CollectorOperator());
     collector.prefix = "" + System.identityHashCode(collector);
@@ -209,13 +210,19 @@ public class PartitioningTest
     Assert.assertEquals("merged tuples " + pmerged, Sets.newHashSet(testData[0]), Sets.newHashSet(tuples));
   }
 
-  public static class PartitionLoadWatch implements StatsListener, java.io.Serializable
+  public static class PartitionLoadWatch implements StatsListenerWithContext, java.io.Serializable
   {
     private static final long serialVersionUID = 1L;
     private static final ThreadLocal<Map<Integer, Integer>> loadIndicators = new ThreadLocal<>();
 
     @Override
-    public Response processStats(BatchedOperatorStats status)
+    public Response processStats(BatchedOperatorStats stats)
+    {
+      return processStats(stats, null);
+    }
+
+    @Override
+    public Response processStats(BatchedOperatorStats status, StatsListenerContext context)
     {
       Response hbr = null;
       Map<Integer, Integer> m = loadIndicators.get();
@@ -234,7 +241,7 @@ public class PartitioningTest
     {
       Map<Integer, Integer> m = loadIndicators.get();
       if (m == null) {
-        loadIndicators.set(m = new ConcurrentHashMap<Integer, Integer>());
+        loadIndicators.set(m = new ConcurrentHashMap<>());
       }
       m.put(oper.getId(), load);
     }
@@ -341,7 +348,7 @@ public class PartitioningTest
     Assert.assertNotNull("" + nodeMap, inputDeployed);
 
     // add tuple that matches the partition key and check that each partition receives it
-    ArrayList<Integer> inputTuples = new ArrayList<Integer>();
+    ArrayList<Integer> inputTuples = new ArrayList<>();
     LOG.debug("Number of partitions {}", partitions.size());
     for (PTOperator p: partitions) {
       // default partitioning has one port mapping with a single partition key
@@ -391,7 +398,7 @@ public class PartitioningTest
     @Override
     public Collection<Partition<PartitionableInputOperator>> definePartitions(Collection<Partition<PartitionableInputOperator>> partitions, PartitioningContext context)
     {
-      List<Partition<PartitionableInputOperator>> newPartitions = new ArrayList<Partition<PartitionableInputOperator>>(3);
+      List<Partition<PartitionableInputOperator>> newPartitions = new ArrayList<>(3);
       Iterator<? extends Partition<PartitionableInputOperator>> iterator = partitions.iterator();
       Partition<PartitionableInputOperator> templatePartition;
       for (int i = 0; i < 3; i++) {
@@ -401,7 +408,7 @@ public class PartitioningTest
           op.partitionProperty = templatePartition.getPartitionedInstance().partitionProperty;
         }
         op.partitionProperty += "_" + i;
-        newPartitions.add(new DefaultPartition<PartitionableInputOperator>(op));
+        newPartitions.add(new DefaultPartition<>(op));
       }
       return newPartitions;
     }
@@ -431,7 +438,7 @@ public class PartitioningTest
       lc.runAsync();
 
       List<PTOperator> partitions = assertNumberPartitions(3, lc, dag.getMeta(input));
-      Set<String> partProperties = new HashSet<String>();
+      Set<String> partProperties = new HashSet<>();
       for (PTOperator p : partitions) {
         LocalStreamingContainer c = StramTestSupport.waitForActivation(lc, p);
         Map<Integer, Node<?>> nodeMap = c.getNodes();
@@ -460,7 +467,7 @@ public class PartitioningTest
       PartitionLoadWatch.remove(partitions.get(0));
 
       partitions = assertNumberPartitions(3, lc, dag.getMeta(input));
-      partProperties = new HashSet<String>();
+      partProperties = new HashSet<>();
       for (PTOperator p: partitions) {
         LocalStreamingContainer c = StramTestSupport.waitForActivation(lc, p);
         Map<Integer, Node<?>> nodeMap = c.getNodes();

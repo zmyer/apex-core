@@ -20,6 +20,7 @@ package com.datatorrent.stram.cli;
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.FileReader;
 import java.io.IOException;
@@ -33,11 +34,13 @@ import java.net.URLEncoder;
 import java.security.PrivilegedExceptionAction;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
@@ -91,13 +94,13 @@ import org.apache.tools.ant.DirectoryScanner;
 import com.google.common.base.Preconditions;
 import com.sun.jersey.api.client.WebResource;
 
-import com.datatorrent.api.Context;
 import com.datatorrent.api.DAG.GenericOperator;
 import com.datatorrent.api.Operator;
 import com.datatorrent.api.StreamingApplication;
 import com.datatorrent.stram.StramUtils;
 import com.datatorrent.stram.client.AppPackage;
 import com.datatorrent.stram.client.AppPackage.AppInfo;
+import com.datatorrent.stram.client.AppPackage.PropertyInfo;
 import com.datatorrent.stram.client.ConfigPackage;
 import com.datatorrent.stram.client.DTConfiguration;
 import com.datatorrent.stram.client.DTConfiguration.Scope;
@@ -110,6 +113,7 @@ import com.datatorrent.stram.client.StramClientUtils;
 import com.datatorrent.stram.client.StramClientUtils.ClientRMHelper;
 import com.datatorrent.stram.codec.LogicalPlanSerializer;
 import com.datatorrent.stram.plan.logical.LogicalPlan;
+import com.datatorrent.stram.plan.logical.LogicalPlanConfiguration;
 import com.datatorrent.stram.plan.logical.requests.AddStreamSinkRequest;
 import com.datatorrent.stram.plan.logical.requests.CreateOperatorRequest;
 import com.datatorrent.stram.plan.logical.requests.CreateStreamRequest;
@@ -122,6 +126,7 @@ import com.datatorrent.stram.plan.logical.requests.SetPortAttributeRequest;
 import com.datatorrent.stram.plan.logical.requests.SetStreamAttributeRequest;
 import com.datatorrent.stram.security.StramUserLogin;
 import com.datatorrent.stram.util.JSONSerializationProvider;
+import com.datatorrent.stram.util.LoggerUtil;
 import com.datatorrent.stram.util.SecurityUtils;
 import com.datatorrent.stram.util.VersionInfo;
 import com.datatorrent.stram.util.WebServicesClient;
@@ -138,7 +143,6 @@ import jline.console.completer.StringsCompleter;
 import jline.console.history.FileHistory;
 import jline.console.history.History;
 import jline.console.history.MemoryHistory;
-import net.lingala.zip4j.exception.ZipException;
 import sun.misc.Signal;
 import sun.misc.SignalHandler;
 
@@ -152,10 +156,22 @@ import sun.misc.SignalHandler;
 public class ApexCli
 {
   private static final Logger LOG = LoggerFactory.getLogger(ApexCli.class);
-  private Configuration conf;
+  private static String CONFIG_EXCLUSIVE = "exclusive";
+  private static String CONFIG_INCLUSIVE = "inclusive";
+
+  private static final String COLOR_RED = "\033[38;5;196m";
+  private static final String COLOR_YELLOW = "\033[0;93m";
+  private static final String FORMAT_BOLD = "\033[1m";
+
+  private static final String COLOR_RESET = "\033[0m";
+  private static final String ITALICS = "\033[3m";
+  private static final String APEX_HIGHLIGHT_COLOR_PROPERTY_NAME = "apex.cli.color.highlight";
+  private static final String APEX_HIGHLIGHT_COLOR_ENV_VAR_NAME = "APEX_HIGHLIGHT_COLOR";
+
+  protected Configuration conf;
   private FileSystem fs;
   private StramAgent stramAgent;
-  private final YarnClient yarnClient = YarnClient.createYarnClient();
+  private YarnClient yarnClient = null;
   private ApplicationReport currentApp = null;
   private boolean consolePresent;
   private String[] commandsToExecute;
@@ -184,9 +200,7 @@ public class ApexCli
   private String forcePrompt;
   private String kerberosPrincipal;
   private String kerberosKeyTab;
-
-  private static String CONFIG_EXCLUSIVE = "exclusive";
-  private static String CONFIG_INCLUSIVE = "inclusive";
+  private String highlightColor = null;
 
   private static class FileLineReader extends ConsoleReader
   {
@@ -449,7 +463,26 @@ public class ApexCli
     }
   }
 
-  AppPackage newAppPackageInstance(File f) throws IOException, ZipException
+  AppPackage newAppPackageInstance(URI uri, boolean suppressOutput) throws IOException
+  {
+    PrintStream outputStream = suppressOutput ? suppressOutput() : null;
+    try {
+      final String scheme = uri.getScheme();
+      if (scheme == null || scheme.equals("file")) {
+        return new AppPackage(new FileInputStream(new File(expandFileName(uri.getPath(), true))), true);
+      } else {
+        try (FileSystem fs = FileSystem.newInstance(uri, conf)) {
+          return new AppPackage(fs.open(new Path(uri.getPath())), true);
+        }
+      }
+    } finally {
+      if (outputStream != null) {
+        restoreOutput(outputStream);
+      }
+    }
+  }
+
+  AppPackage newAppPackageInstance(File f) throws IOException
   {
     PrintStream outputStream = suppressOutput();
     try {
@@ -598,12 +631,12 @@ public class ApexCli
         "Connect to an app"));
     globalCommands.put("launch", new OptionsCommandSpec(new LaunchCommand(),
         new Arg[]{},
-        new Arg[]{new FileArg("jar-file/json-file/properties-file/app-package-file"), new Arg("matching-app-name")},
+        new Arg[]{new FileArg("jar-file/json-file/properties-file/app-package-file-path/app-package-file-uri"), new Arg("matching-app-name")},
         "Launch an app", LAUNCH_OPTIONS.options));
     globalCommands.put("shutdown-app", new CommandSpec(new ShutdownAppCommand(),
-        new Arg[]{new Arg("app-id")},
-        new Arg[]{new VarArg("app-id")},
-        "Shutdown an app"));
+        new Arg[]{new Arg("app-id/app-name")},
+        new Arg[]{new VarArg("app-id/app-name")},
+        "Shutdown application(s) by id or name"));
     globalCommands.put("list-apps", new CommandSpec(new ListAppsCommand(),
         null,
         new Arg[]{new Arg("pattern")},
@@ -661,17 +694,18 @@ public class ApexCli
         null,
         new Arg[]{new FileArg("parameter-name")},
         "Get the configuration parameter"));
-    globalCommands.put("get-app-package-info", new CommandSpec(new GetAppPackageInfoCommand(),
-        new Arg[]{new FileArg("app-package-file")},
-        null,
-        "Get info on the app package file"));
+    globalCommands.put("get-app-package-info", new OptionsCommandSpec(new GetAppPackageInfoCommand(),
+        new Arg[]{new FileArg("app-package-file-path/app-package-file-uri")},
+        new Arg[]{new Arg("-withDescription")},
+        "Get info on the app package file",
+        GET_APP_PACKAGE_INFO_OPTIONS));
     globalCommands.put("get-app-package-operators", new OptionsCommandSpec(new GetAppPackageOperatorsCommand(),
-        new Arg[]{new FileArg("app-package-file")},
+        new Arg[]{new FileArg("app-package-file-path/app-package-file-uri")},
         new Arg[]{new Arg("search-term")},
         "Get operators within the given app package",
         GET_OPERATOR_CLASSES_OPTIONS.options));
     globalCommands.put("get-app-package-operator-properties", new CommandSpec(new GetAppPackageOperatorPropertiesCommand(),
-        new Arg[]{new FileArg("app-package-file"), new Arg("operator-class")},
+        new Arg[]{new FileArg("app-package-file-path/app-package-file-uri"), new Arg("operator-class")},
         null,
         "Get operator properties within the given app package"));
     globalCommands.put("list-default-app-attributes", new CommandSpec(new ListDefaultAttributesCommand(AttributesType.APPLICATION),
@@ -706,7 +740,7 @@ public class ApexCli
         "Kill a container"));
     connectedCommands.put("shutdown-app", new CommandSpec(new ShutdownAppCommand(),
         null,
-        new Arg[]{new VarArg("app-id")},
+        new Arg[]{new VarArg("app-id/app-name")},
         "Shutdown an app"));
     connectedCommands.put("kill-app", new CommandSpec(new KillAppCommand(),
         null,
@@ -759,7 +793,7 @@ public class ApexCli
         "Begin Logical Plan Change"));
     connectedCommands.put("show-logical-plan", new OptionsCommandSpec(new ShowLogicalPlanCommand(),
         null,
-        new Arg[]{new FileArg("jar-file/app-package-file"), new Arg("class-name")},
+        new Arg[]{new FileArg("jar-file/app-package-file-path/app-package-file-uri"), new Arg("class-name")},
         "Show logical plan of an app class",
         getShowLogicalPlanCommandLineOptions()));
     connectedCommands.put("dump-properties-file", new CommandSpec(new DumpPropertiesFileCommand(),
@@ -778,6 +812,10 @@ public class ApexCli
         null,
         new Arg[]{new Arg("container-id")},
         "Get the stack trace for the container"));
+    connectedCommands.put("set-log-level", new CommandSpec(new SetLogLevelCommand(),
+        new Arg[]{new Arg("target"), new Arg("logLevel")},
+        null,
+        "Set the logging level of any package or class of the connected app instance"));
 
     //
     // Logical plan change command specification starts here
@@ -1153,6 +1191,22 @@ public class ApexCli
     }
   }
 
+  /**
+   * get highlight color based on env variable first and then config
+   *
+   */
+  protected String getHighlightColor()
+  {
+    if (highlightColor == null) {
+      highlightColor = System.getenv(APEX_HIGHLIGHT_COLOR_ENV_VAR_NAME);
+      if (StringUtils.isBlank(highlightColor)) {
+        highlightColor = conf.get(APEX_HIGHLIGHT_COLOR_PROPERTY_NAME, FORMAT_BOLD);
+      }
+      highlightColor = highlightColor.replace("\\e", "\033");
+    }
+    return highlightColor;
+  }
+
   public void init() throws IOException
   {
     conf = StramClientUtils.addDTSiteResources(new YarnConfiguration());
@@ -1160,8 +1214,7 @@ public class ApexCli
     fs = StramClientUtils.newFileSystemInstance(conf);
     stramAgent = new StramAgent(fs, conf);
 
-    yarnClient.init(conf);
-    yarnClient.start();
+    yarnClient = StramClientUtils.createYarnClient(conf);
     LOG.debug("Yarn Client initialized and started");
     String socks = conf.get(CommonConfigurationKeysPublic.HADOOP_SOCKS_SERVER_KEY);
     if (socks != null) {
@@ -1411,7 +1464,7 @@ public class ApexCli
     return s.substring(i);
   }
 
-  private void processLine(String line, final ConsoleReader reader, boolean expandMacroAlias)
+  protected void processLine(String line, final ConsoleReader reader, boolean expandMacroAlias)
   {
     try {
       // clear interrupt flag
@@ -1532,9 +1585,9 @@ public class ApexCli
   private void printHelp(String command, CommandSpec commandSpec, PrintStream os)
   {
     if (consolePresent) {
-      os.print("\033[0;93m");
+      os.print(getHighlightColor());
       os.print(command);
-      os.print("\033[0m");
+      os.print(COLOR_RESET);
     } else {
       os.print(command);
     }
@@ -1547,7 +1600,7 @@ public class ApexCli
     if (commandSpec.requiredArgs != null) {
       for (Arg arg : commandSpec.requiredArgs) {
         if (consolePresent) {
-          os.print(" \033[3m" + arg + "\033[0m");
+          os.print(" " + ITALICS + arg + COLOR_RESET);
         } else {
           os.print(" <" + arg + ">");
         }
@@ -1556,7 +1609,7 @@ public class ApexCli
     if (commandSpec.optionalArgs != null) {
       for (Arg arg : commandSpec.optionalArgs) {
         if (consolePresent) {
-          os.print(" [\033[3m" + arg + "\033[0m");
+          os.print(" [" + ITALICS + arg + COLOR_RESET);
         } else {
           os.print(" [<" + arg + ">");
         }
@@ -1916,7 +1969,7 @@ public class ApexCli
             // see if it's an app package
             AppPackage ap = null;
             try {
-              ap = newAppPackageInstance(new File(fileName));
+              ap = newAppPackageInstance(new URI(fileName), true);
             } catch (Exception ex) {
               // It's not an app package
               if (requiredAppPackageName != null) {
@@ -2061,13 +2114,11 @@ public class ApexCli
 
         if (appFactory != null) {
           if (!commandLineInfo.localMode) {
-
             // see whether there is an app with the same name and user name running
-            String appNameAttributeName = StreamingApplication.DT_PREFIX + Context.DAGContext.APPLICATION_NAME.getName();
-            String appName = config.get(appNameAttributeName, appFactory.getName());
+            String appName = config.get(LogicalPlanConfiguration.KEY_APPLICATION_NAME, appFactory.getName());
             ApplicationReport duplicateApp = StramClientUtils.getStartedAppInstanceByName(yarnClient, appName, UserGroupInformation.getLoginUser().getUserName(), null);
             if (duplicateApp != null) {
-              throw new CliException("Application with the name \"" + duplicateApp.getName() + "\" already running under the current user \"" + duplicateApp.getUser() + "\". Please choose another name. You can change the name by setting " + appNameAttributeName);
+              throw new CliException("Application with the name \"" + duplicateApp.getName() + "\" already running under the current user \"" + duplicateApp.getUser() + "\". Please choose another name. You can change the name by setting " + LogicalPlanConfiguration.KEY_APPLICATION_NAME);
             }
 
             // This is for suppressing System.out printouts from applications so that the user of CLI will not be confused by those printouts
@@ -2100,7 +2151,7 @@ public class ApexCli
         } else {
           System.err.println("No application specified.");
         }
-
+        submitApp.resetContextClassLoader();
       } finally {
         IOUtils.closeQuietly(cp);
       }
@@ -2133,49 +2184,85 @@ public class ApexCli
 
   }
 
+  private ApplicationReport findApplicationReportFromAppNameOrId(String appNameOrId)
+  {
+    ApplicationReport app = getApplication(appNameOrId);
+    if (app == null) {
+      app = getApplicationByName(appNameOrId);
+    }
+    return app;
+  }
+
   private class ShutdownAppCommand implements Command
   {
     @Override
     public void execute(String[] args, ConsoleReader reader) throws Exception
     {
-      ApplicationReport[] apps;
+      Map<String, ApplicationReport> appIdReports = new LinkedHashMap<>();
+
       if (args.length == 1) {
         if (currentApp == null) {
           throw new CliException("No application selected");
         } else {
-          apps = new ApplicationReport[]{currentApp};
+          appIdReports.put(currentApp.getApplicationId().toString(), currentApp);
         }
       } else {
-        apps = new ApplicationReport[args.length - 1];
-        for (int i = 1; i < args.length; i++) {
-          apps[i - 1] = getApplication(args[i]);
-          if (apps[i - 1] == null) {
-            throw new CliException("Streaming application with id " + args[i] + " is not found.");
-          }
+        String[] appNamesOrIds = Arrays.copyOfRange(args, 1, args.length);
+
+        for (String appNameOrId : appNamesOrIds) {
+          ApplicationReport ap = findApplicationReportFromAppNameOrId(appNameOrId);
+          appIdReports.put(appNameOrId, ap);
         }
       }
 
-      for (ApplicationReport app : apps) {
-        try {
-          JSONObject response = getResource(new StramAgent.StramUriSpec().path(StramWebServices.PATH_SHUTDOWN), app, new WebServicesClient.WebServicesHandler<JSONObject>()
-          {
-            @Override
-            public JSONObject process(WebResource.Builder webResource, Class<JSONObject> clazz)
-            {
-              return webResource.accept(MediaType.APPLICATION_JSON).post(clazz, new JSONObject());
-            }
+      for (Map.Entry<String, ApplicationReport> entry : appIdReports.entrySet()) {
+        String appNameOrId = entry.getKey();
+        ApplicationReport app = entry.getValue();
 
-          });
-          if (consolePresent) {
-            System.out.println("Shutdown requested: " + response);
-          }
-          currentApp = null;
-        } catch (Exception e) {
-          throw new CliException("Failed to request shutdown for appid " + app.getApplicationId().toString(), e);
-        }
+        shutdownApp(appNameOrId, app);
       }
     }
 
+    private void shutdownApp(String appNameOrId, ApplicationReport app)
+    {
+      if (app == null) {
+        String errMessage = "Failed to request shutdown for app %s: Application with id or name %s not found%n";
+        System.err.printf(errMessage, appNameOrId, appNameOrId);
+        return;
+      }
+
+      try {
+        JSONObject response = sendShutdownRequest(app);
+        if (consolePresent) {
+          System.out.printf("Shutdown of app %s requested: %s%n", app.getApplicationId().toString(), response);
+        }
+      } catch (Exception e) {
+        String errMessage = "Failed to request shutdown for app %s: %s%n";
+        System.err.printf(errMessage, app.getApplicationId().toString(), e.getMessage());
+      } finally {
+        if (currentApp != null) {
+          if (app.getApplicationId().equals(currentApp.getApplicationId())) {
+            currentApp = null;
+          }
+        }
+      }
+    }
+  }
+
+  protected JSONObject sendShutdownRequest(ApplicationReport app)
+  {
+    StramAgent.StramUriSpec uriSpec = new StramAgent.StramUriSpec().path(StramWebServices.PATH_SHUTDOWN);
+
+    WebServicesClient.WebServicesHandler<JSONObject> handler = new WebServicesClient.WebServicesHandler<JSONObject>()
+    {
+      @Override
+      public JSONObject process(WebResource.Builder webResource, Class<JSONObject> clazz)
+      {
+        return webResource.accept(MediaType.APPLICATION_JSON).post(clazz, new JSONObject());
+      }
+    };
+
+    return getResource(uriSpec, app, handler);
   }
 
   private class ListAppsCommand implements Command
@@ -2279,17 +2366,11 @@ public class ApexCli
       int i = 0;
       try {
         while (++i < args.length) {
-          app = getApplication(args[i]);
+          app = findApplicationReportFromAppNameOrId(args[i]);
           if (app == null) {
-
-            /*
-             * try once again with application name type.
-             */
-            app = getApplicationByName(args[i]);
-            if (app == null) {
-              throw new CliException("Streaming application with id or name " + args[i] + " is not found.");
-            }
+            throw new CliException("Streaming application with id or name " + args[i] + " is not found.");
           }
+
           yarnClient.killApplication(app.getApplicationId());
           if (app == currentApp) {
             currentApp = null;
@@ -2356,6 +2437,7 @@ public class ApexCli
           LOG.warn("Cannot flush command history");
         }
       }
+      yarnClient.stop();
       System.exit(0);
     }
 
@@ -2814,26 +2896,25 @@ public class ApexCli
       }
 
       if (commandLineInfo.args.length > 0) {
-        String filename = expandFileName(commandLineInfo.args[0], true);
-
         // see if the first argument is actually an app package
-        try {
-          AppPackage ap = new AppPackage(new File(filename));
-          ap.close();
+        try (AppPackage ap = newAppPackageInstance(new URI(commandLineInfo.args[0]), false)) {
           new ShowLogicalPlanAppPackageCommand().execute(args, reader);
           return;
         } catch (Exception ex) {
           // fall through
         }
 
+        String filename = expandFileName(commandLineInfo.args[0], true);
         if (commandLineInfo.args.length >= 2) {
           String appName = commandLineInfo.args[1];
           StramAppLauncher submitApp = getStramAppLauncher(filename, config, commandLineInfo.ignorePom);
           submitApp.loadDependencies();
           List<AppFactory> matchingAppFactories = getMatchingAppFactories(submitApp, appName, commandLineInfo.exactMatch);
           if (matchingAppFactories == null || matchingAppFactories.isEmpty()) {
+            submitApp.resetContextClassLoader();
             throw new CliException("No application in jar file matches '" + appName + "'");
           } else if (matchingAppFactories.size() > 1) {
+            submitApp.resetContextClassLoader();
             throw new CliException("More than one application in jar file match '" + appName + "'");
           } else {
             Map<String, Object> map = new HashMap<>();
@@ -2861,6 +2942,7 @@ public class ApexCli
               }
             }
             printJson(map);
+            submitApp.resetContextClassLoader();
           }
         } else {
           if (filename.endsWith(".json")) {
@@ -2892,6 +2974,7 @@ public class ApexCli
               appList.add(m);
             }
             printJson(appList, "applications");
+            submitApp.resetContextClassLoader();
           }
         }
       } else {
@@ -2910,8 +2993,7 @@ public class ApexCli
     @Override
     public void execute(String[] args, ConsoleReader reader) throws Exception
     {
-      String jarfile = expandFileName(args[1], true);
-      try (AppPackage ap = newAppPackageInstance(new File(jarfile))) {
+      try (AppPackage ap = newAppPackageInstance(new URI(args[1]), true)) {
         List<AppInfo> applications = ap.getApplications();
 
         if (args.length >= 3) {
@@ -2969,10 +3051,17 @@ public class ApexCli
     return tmpDir;
   }
 
+  private static Options GET_APP_PACKAGE_INFO_OPTIONS = new Options();
+
+  static {
+    GET_APP_PACKAGE_INFO_OPTIONS
+        .addOption(new Option("withDescription", false, "Get default properties with description"));
+  }
+
   public static class GetOperatorClassesCommandLineOptions
   {
     final Options options = new Options();
-    final Option parent = add(new Option("parent", "Specify the parent class for the operators"));
+    final Option parent = add(new Option("parent", true, "Specify the parent class for the operators"));
 
     private Option add(Option opt)
     {
@@ -2984,13 +3073,27 @@ public class ApexCli
 
   private static GetOperatorClassesCommandLineOptions GET_OPERATOR_CLASSES_OPTIONS = new GetOperatorClassesCommandLineOptions();
 
-  private static class GetOperatorClassesCommandLineInfo
+  static class GetAppPackageInfoCommandLineInfo
+  {
+    boolean provideDescription;
+  }
+
+  static GetAppPackageInfoCommandLineInfo getGetAppPackageInfoCommandLineInfo(String[] args) throws ParseException
+  {
+    CommandLineParser parser = new PosixParser();
+    GetAppPackageInfoCommandLineInfo result = new GetAppPackageInfoCommandLineInfo();
+    CommandLine line = parser.parse(GET_APP_PACKAGE_INFO_OPTIONS, args);
+    result.provideDescription = line.hasOption("withDescription");
+    return result;
+  }
+
+  static class GetOperatorClassesCommandLineInfo
   {
     String parent;
     String[] args;
   }
 
-  private static GetOperatorClassesCommandLineInfo getGetOperatorClassesCommandLineInfo(String[] args) throws ParseException
+  static GetOperatorClassesCommandLineInfo getGetOperatorClassesCommandLineInfo(String[] args) throws ParseException
   {
     CommandLineParser parser = new PosixParser();
     GetOperatorClassesCommandLineInfo result = new GetOperatorClassesCommandLineInfo();
@@ -3101,8 +3204,10 @@ public class ApexCli
         submitApp.loadDependencies();
         List<AppFactory> matchingAppFactories = getMatchingAppFactories(submitApp, appName, true);
         if (matchingAppFactories == null || matchingAppFactories.isEmpty()) {
+          submitApp.resetContextClassLoader();
           throw new CliException("No application in jar file matches '" + appName + "'");
         } else if (matchingAppFactories.size() > 1) {
+          submitApp.resetContextClassLoader();
           throw new CliException("More than one application in jar file match '" + appName + "'");
         } else {
           AppFactory appFactory = matchingAppFactories.get(0);
@@ -3112,6 +3217,7 @@ public class ApexCli
             file.createNewFile();
           }
           LogicalPlanSerializer.convertToProperties(logicalPlan).save(file);
+          submitApp.resetContextClassLoader();
         }
       } else {
         if (currentApp == null) {
@@ -3447,14 +3553,18 @@ public class ApexCli
     @Override
     public void execute(String[] args, ConsoleReader reader) throws Exception
     {
-      try (AppPackage ap = newAppPackageInstance(new File(expandFileName(args[1], true)))) {
+      String[] tmpArgs = new String[args.length - 2];
+      System.arraycopy(args, 2, tmpArgs, 0, args.length - 2);
+      GetAppPackageInfoCommandLineInfo commandLineInfo = getGetAppPackageInfoCommandLineInfo(tmpArgs);
+      try (AppPackage ap = newAppPackageInstance(new URI(args[1]), true)) {
         JSONSerializationProvider jomp = new JSONSerializationProvider();
+        jomp.addSerializer(PropertyInfo.class,
+            new AppPackage.PropertyInfoSerializer(commandLineInfo.provideDescription));
         JSONObject apInfo = new JSONObject(jomp.getContext(null).writeValueAsString(ap));
         apInfo.remove("name");
         printJson(apInfo);
       }
     }
-
   }
 
   private void checkConfigPackageCompatible(AppPackage ap, ConfigPackage cp)
@@ -3702,11 +3812,11 @@ public class ApexCli
         break;
       }
     }
-    Map<String, String> defaultProperties = selectedApp == null ? ap.getDefaultProperties() : selectedApp.defaultProperties;
+    Map<String, PropertyInfo> defaultProperties = selectedApp == null ? ap.getDefaultProperties() : selectedApp.defaultProperties;
     Set<String> requiredProperties = new TreeSet<>(selectedApp == null ? ap.getRequiredProperties() : selectedApp.requiredProperties);
 
-    for (Map.Entry<String, String> entry : defaultProperties.entrySet()) {
-      launchProperties.set(entry.getKey(), entry.getValue(), Scope.TRANSIENT, null);
+    for (Map.Entry<String, PropertyInfo> entry : defaultProperties.entrySet()) {
+      launchProperties.set(entry.getKey(), entry.getValue().getValue(), Scope.TRANSIENT, entry.getValue().getDescription());
       requiredProperties.remove(entry.getKey());
     }
 
@@ -3720,9 +3830,11 @@ public class ApexCli
       while (it.hasNext()) {
         Entry<String, String> entry = it.next();
         // filter relevant entries
-        if (entry.getKey().startsWith(StreamingApplication.DT_PREFIX)) {
-          launchProperties.set(entry.getKey(), entry.getValue(), Scope.TRANSIENT, null);
-          requiredProperties.remove(entry.getKey());
+        String key = entry.getKey();
+        if (key.startsWith(StreamingApplication.DT_PREFIX)
+            || key.startsWith(StreamingApplication.APEX_PREFIX)) {
+          launchProperties.set(key, entry.getValue(), Scope.TRANSIENT, null);
+          requiredProperties.remove(key);
         }
       }
     }
@@ -3824,7 +3936,7 @@ public class ApexCli
       String[] tmpArgs = new String[args.length - 1];
       System.arraycopy(args, 1, tmpArgs, 0, args.length - 1);
       GetOperatorClassesCommandLineInfo commandLineInfo = getGetOperatorClassesCommandLineInfo(tmpArgs);
-      try (AppPackage ap = newAppPackageInstance(new File(expandFileName(commandLineInfo.args[0], true)))) {
+      try (AppPackage ap = newAppPackageInstance(new URI(commandLineInfo.args[0]), true)) {
         List<String> newArgs = new ArrayList<>();
         List<String> jars = new ArrayList<>();
         for (String jar : ap.getAppJars()) {
@@ -3854,7 +3966,7 @@ public class ApexCli
     @Override
     public void execute(String[] args, ConsoleReader reader) throws Exception
     {
-      try (AppPackage ap = newAppPackageInstance(new File(expandFileName(args[1], true)))) {
+      try (AppPackage ap = newAppPackageInstance(new URI(args[1]), true)) {
         List<String> newArgs = new ArrayList<>();
         List<String> jars = new ArrayList<>();
         for (String jar : ap.getAppJars()) {
@@ -3916,6 +4028,50 @@ public class ApexCli
       }
       result.put("applications", appArray);
       printJson(result);
+    }
+  }
+
+  private class SetLogLevelCommand implements Command
+  {
+
+    @Override
+    public void execute(String[] args, ConsoleReader reader) throws Exception
+    {
+      ApplicationReport appReport = currentApp;
+      String target = args[1];
+      String logLevel = args[2];
+
+      StramAgent.StramUriSpec uriSpec = new StramAgent.StramUriSpec();
+      uriSpec = uriSpec.path(StramWebServices.PATH_LOGGERS);
+      final JSONObject request = buildRequest(target, logLevel);
+
+      JSONObject response = getResource(uriSpec, appReport, new WebServicesClient.WebServicesHandler<JSONObject>()
+      {
+        @Override
+        public JSONObject process(WebResource.Builder webResource, Class<JSONObject> clazz)
+        {
+          return webResource.accept(MediaType.APPLICATION_JSON).post(JSONObject.class, request);
+        }
+
+      });
+
+      printJson(response);
+    }
+
+    private JSONObject buildRequest(String target, String logLevel) throws JSONException
+    {
+      JSONObject request = new JSONObject();
+      JSONArray loggers = new JSONArray();
+      JSONObject targetAndLevelPair = new JSONObject();
+
+      targetAndLevelPair.put("target", target);
+      targetAndLevelPair.put("logLevel", logLevel);
+
+      loggers.put(targetAndLevelPair);
+
+      request.put("loggers", loggers);
+
+      return request;
     }
   }
 
@@ -4060,6 +4216,7 @@ public class ApexCli
 
   public static void main(final String[] args) throws Exception
   {
+    LoggerUtil.setupMDC("client");
     final ApexCli shell = new ApexCli();
     shell.preImpersonationInit(args);
     String hadoopUserName = System.getenv("HADOOP_USER_NAME");

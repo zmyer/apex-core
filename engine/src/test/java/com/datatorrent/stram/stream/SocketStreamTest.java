@@ -81,8 +81,8 @@ public class SocketStreamTest
   public static void setup() throws InterruptedException, IOException, Exception
   {
     ((DefaultEventLoop)eventloop).start();
-    bufferServer = new Server(0); // find random port
-    InetSocketAddress bindAddr = bufferServer.run(eventloop);
+    bufferServer = new Server(eventloop, 0); // find random port
+    InetSocketAddress bindAddr = bufferServer.run();
     bufferServerPort = bindAddr.getPort();
   }
 
@@ -90,7 +90,7 @@ public class SocketStreamTest
   public static void tearDown() throws IOException
   {
     if (bufferServer != null) {
-      eventloop.stop(bufferServer);
+      bufferServer.stop();
     }
     ((DefaultEventLoop)eventloop).stop();
   }
@@ -149,7 +149,7 @@ public class SocketStreamTest
   @Before
   public void init()
   {
-    final StreamCodec<Object> serde = new DefaultStatefulStreamCodec<Object>();
+    final StreamCodec<Object> serde = new DefaultStatefulStreamCodec<>();
     messageCount = new AtomicInteger(0);
 
     Sink<Object> sink = new Sink<Object>()

@@ -18,7 +18,6 @@
  */
 package com.datatorrent.stram.client;
 
-import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -313,7 +312,7 @@ public class StramAgent extends FSAgent
 
   public String getAppsRoot()
   {
-    return (defaultStramRoot == null) ? (StramClientUtils.getDTDFSRootDir(fileSystem, conf) + "/" + StramClientUtils.SUBDIR_APPS) : defaultStramRoot;
+    return (defaultStramRoot == null) ? (StramClientUtils.getApexDFSRootDir(fileSystem, conf) + "/" + StramClientUtils.SUBDIR_APPS) : defaultStramRoot;
   }
 
   public String getAppPath(String appId)
@@ -332,12 +331,8 @@ public class StramAgent extends FSAgent
 
   private StramWebServicesInfo retrieveWebServicesInfo(String appId)
   {
-    YarnClient yarnClient = YarnClient.createYarnClient();
     String url;
-    try {
-      yarnClient.init(conf);
-      yarnClient.start();
-
+    try (YarnClient yarnClient = StramClientUtils.createYarnClient(conf)) {
       ApplicationReport ar = yarnClient.getApplicationReport(ConverterUtils.toApplicationId(appId));
       if (ar == null) {
         LOG.warn("YARN does not have record for this application {}", appId);
@@ -365,8 +360,6 @@ public class StramAgent extends FSAgent
     } catch (Exception ex) {
       LOG.error("Cannot retrieve web services info", ex);
       return null;
-    } finally {
-      yarnClient.stop();
     }
 
     WebServicesClient webServicesClient = new WebServicesClient();
@@ -418,10 +411,22 @@ public class StramAgent extends FSAgent
       String appPath = response.getString("appPath");
       String user = response.getString("user");
       JSONObject permissionsInfo = null;
-      try (FSDataInputStream is = fileSystem.open(new Path(appPath, "permissions.json"))) {
-        permissionsInfo = new JSONObject(IOUtils.toString(is));
-      } catch (FileNotFoundException ex) {
-        // ignore if file is not found
+      Path permissionsPath = new Path(appPath, "permissions.json");
+      LOG.debug("Checking for permission information in file {}", permissionsPath);
+      try {
+        if (fileSystem.exists(permissionsPath)) {
+          LOG.info("Loading permission information");
+          try (FSDataInputStream is = fileSystem.open(permissionsPath)) {
+            permissionsInfo = new JSONObject(IOUtils.toString(is));
+          }
+          LOG.debug("Loaded permission file successfully");
+        } else {
+          // ignore and log messages if file is not found
+          LOG.info("Permission information is not available as the application is not configured with it");
+        }
+      } catch (IOException ex) {
+        // ignore and log message when unable to read the file
+        LOG.info("Permission information is not available", ex);
       }
       return new StramWebServicesInfo(appMasterUrl, version, appPath, user, secToken, permissionsInfo);
     } catch (Exception ex) {

@@ -80,6 +80,8 @@ import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Sets;
 
+import com.datatorrent.api.Attribute;
+import com.datatorrent.api.Context;
 import com.datatorrent.api.StreamingApplication;
 import com.datatorrent.stram.StramClient;
 import com.datatorrent.stram.StramUtils;
@@ -101,6 +103,7 @@ public class StramClientUtils
 {
   public static final String DT_VERSION = StreamingApplication.DT_PREFIX + "version";
   public static final String DT_DFS_ROOT_DIR = StreamingApplication.DT_PREFIX + "dfsRootDirectory";
+  public static final String APEX_APP_DFS_ROOT_DIR = StreamingApplication.APEX_PREFIX + "app.dfsRootDirectory";
   public static final String DT_DFS_USER_NAME = "%USER_NAME%";
   public static final String DT_CONFIG_STATUS = StreamingApplication.DT_PREFIX + "configStatus";
   public static final String SUBDIR_APPS = "apps";
@@ -110,10 +113,12 @@ public class StramClientUtils
   public static final String DT_HDFS_TOKEN_MAX_LIFE_TIME = StreamingApplication.DT_PREFIX + "namenode.delegation.token.max-lifetime";
   public static final String HDFS_TOKEN_MAX_LIFE_TIME = "dfs.namenode.delegation.token.max-lifetime";
   public static final String DT_RM_TOKEN_MAX_LIFE_TIME = StreamingApplication.DT_PREFIX + "resourcemanager.delegation.token.max-lifetime";
+  @Deprecated
   public static final String KEY_TAB_FILE = StramUserLogin.DT_AUTH_PREFIX + "store.keytab";
   public static final String TOKEN_ANTICIPATORY_REFRESH_FACTOR = StramUserLogin.DT_AUTH_PREFIX + "token.refresh.factor";
   public static final long DELEGATION_TOKEN_MAX_LIFETIME_DEFAULT = 7 * 24 * 60 * 60 * 1000;
-
+  public static final String TOKEN_REFRESH_PRINCIPAL = StramUserLogin.DT_AUTH_PREFIX + "token.refresh.principal";
+  public static final String TOKEN_REFRESH_KEYTAB = StramUserLogin.DT_AUTH_PREFIX + "token.refresh.keytab";
   /**
    * TBD<p>
    * <br>
@@ -195,7 +200,7 @@ public class StramClientUtils
       this.conf = conf;
     }
 
-    public static interface AppStatusCallback
+    public interface AppStatusCallback
     {
       boolean exitLoop(ApplicationReport report);
 
@@ -269,7 +274,7 @@ public class StramClientUtils
       }
       Text rmTokenService = new Text(Joiner.on(',').join(services));
 
-      return new Token<RMDelegationTokenIdentifier>(
+      return new Token<>(
           rmDelegationToken.getIdentifier().array(),
           rmDelegationToken.getPassword().array(),
           new Text(rmDelegationToken.getKind()),
@@ -310,6 +315,14 @@ public class StramClientUtils
       return socketAddr;
     }
 
+  }
+
+  public static YarnClient createYarnClient(Configuration conf)
+  {
+    YarnClient client = YarnClient.createYarnClient();
+    client.init(conf);
+    client.start();
+    return client;
   }
 
   private static final Logger LOG = LoggerFactory.getLogger(StramClientUtils.class);
@@ -515,28 +528,94 @@ public class StramClientUtils
     }
   }
 
+  /**
+   * Helper function used by both getApexDFSRootDir and getDTDFSRootDir to process dfsRootDir
+   *
+   * @param fs   FileSystem object for HDFS file system
+   * @param conf  Configuration object
+   * @param dfsRootDir  value of dt.dfsRootDir or apex.app.dfsRootDir
+   * @param userShortName  current user short name (either login user or current user depending on impersonation settings)
+   * @param prependHomeDir  prepend user's home dir if dfsRootDir is relative path
+
+   * @return
+   */
+  private static Path evalDFSRootDir(FileSystem fs, Configuration conf, String dfsRootDir, String userShortName,
+      boolean prependHomeDir)
+  {
+    try {
+      if (userShortName != null && dfsRootDir.contains(DT_DFS_USER_NAME)) {
+        dfsRootDir = dfsRootDir.replace(DT_DFS_USER_NAME, userShortName);
+        conf.set(DT_DFS_ROOT_DIR, dfsRootDir);
+      }
+      URI uri = new URI(dfsRootDir);
+      if (uri.isAbsolute()) {
+        return new Path(uri);
+      }
+      if (userShortName != null && prependHomeDir && dfsRootDir.startsWith("/") == false) {
+        dfsRootDir = "/user/" + userShortName + "/" + dfsRootDir;
+      }
+    } catch (URISyntaxException ex) {
+      LOG.warn("{} is not a valid URI. Using the default filesystem to construct the path", dfsRootDir, ex);
+    }
+    return new Path(fs.getUri().getScheme(), fs.getUri().getAuthority(), dfsRootDir);
+  }
+
+  private static String getDefaultRootFolder()
+  {
+    return "datatorrent";
+  }
+
+  /**
+   * This gets the DFS Root dir to be used at runtime by Apex applications as per the following logic:
+   * Value of apex.app.dfsRootDirectory is referred to as Apex-root-dir below.
+   * A "user" refers to either impersonating or impersonated user:
+   *    If apex.application.path.impersonated is true then use impersonated user else impersonating user.
+   *
+   * <ul>
+   * <li> if Apex-root-dir is blank then just call getDTDFSRootDir to get the old behavior
+   * <li> if Apex-root-dir value has %USER_NAME% in the string then replace it with the user's name, else use the absolute path as is.
+   * <li> if Apex-root-dir value is a relative path then append it to the user's home directory.
+   * </ul>
+   *
+   * @param fs FileSystem object for HDFS file system
+   * @param conf  Configuration object
+   * @return
+   * @throws IOException
+   */
+  public static Path getApexDFSRootDir(FileSystem fs, Configuration conf)
+  {
+    String apexDfsRootDir = conf.get(APEX_APP_DFS_ROOT_DIR);
+    boolean useImpersonated = conf.getBoolean(StramUserLogin.DT_APP_PATH_IMPERSONATED, false);
+    String userShortName = null;
+    if (useImpersonated) {
+      try {
+        userShortName = UserGroupInformation.getCurrentUser().getShortUserName();
+      } catch (IOException ex) {
+        LOG.warn("Error getting current/login user name {}", apexDfsRootDir, ex);
+      }
+    }
+    if (!useImpersonated || userShortName == null) {
+      return getDTDFSRootDir(fs, conf);
+    }
+    if (StringUtils.isBlank(apexDfsRootDir)) {
+      apexDfsRootDir = getDefaultRootFolder();
+    }
+    return evalDFSRootDir(fs, conf, apexDfsRootDir, userShortName, true);
+  }
+
   public static Path getDTDFSRootDir(FileSystem fs, Configuration conf)
   {
     String dfsRootDir = conf.get(DT_DFS_ROOT_DIR);
     if (StringUtils.isBlank(dfsRootDir)) {
-      return new Path(fs.getHomeDirectory(), "datatorrent");
-    } else {
-      try {
-        if (dfsRootDir.contains(DT_DFS_USER_NAME)) {
-          dfsRootDir = dfsRootDir.replace(DT_DFS_USER_NAME, UserGroupInformation.getLoginUser().getShortUserName());
-          conf.set(DT_DFS_ROOT_DIR, dfsRootDir);
-        }
-        URI uri = new URI(dfsRootDir);
-        if (uri.isAbsolute()) {
-          return new Path(uri);
-        }
-      } catch (IOException ex) {
-        LOG.warn("Error getting user login name {}", dfsRootDir, ex);
-      } catch (URISyntaxException ex) {
-        LOG.warn("{} is not a valid URI. Using the default filesystem to construct the path", dfsRootDir, ex);
-      }
-      return new Path(fs.getUri().getScheme(), fs.getUri().getAuthority(), dfsRootDir);
+      return new Path(fs.getHomeDirectory(), getDefaultRootFolder());
     }
+    String userShortName = null;
+    try {
+      userShortName = UserGroupInformation.getLoginUser().getShortUserName();
+    } catch (IOException ex) {
+      LOG.warn("Error getting user login name {}", dfsRootDir, ex);
+    }
+    return evalDFSRootDir(fs, conf, dfsRootDir, userShortName, false);
   }
 
   public static Path getDTDFSConfigDir(FileSystem fs, Configuration conf)
@@ -824,7 +903,7 @@ public class StramClientUtils
     List<ApplicationReport> result = new ArrayList<>();
     List<ApplicationReport> applications = clientRMService.getApplications(Sets.newHashSet(StramClient.YARN_APPLICATION_TYPE, StramClient.YARN_APPLICATION_TYPE_DEPRECATED),
         EnumSet.of(YarnApplicationState.FAILED, YarnApplicationState.FINISHED, YarnApplicationState.KILLED));
-    Path appsBasePath = new Path(StramClientUtils.getDTDFSRootDir(fs, conf), StramClientUtils.SUBDIR_APPS);
+    Path appsBasePath = new Path(StramClientUtils.getApexDFSRootDir(fs, conf), StramClientUtils.SUBDIR_APPS);
     for (ApplicationReport ar : applications) {
       long finishTime = ar.getFinishTime();
       if (finishTime < finishedBefore) {
@@ -868,4 +947,12 @@ public class StramClientUtils
     return appInfo;
   }
 
+  public static void addAttributeToArgs(Attribute<String> attribute, Context context, List<CharSequence> vargs)
+  {
+    String value = context.getValue(attribute);
+    if (value != null) {
+      vargs.add(String.format("-D%s=$'%s'", attribute.getLongName(),
+          value.replace("\\", "\\\\\\\\").replaceAll("['\"$]", "\\\\$0")));
+    }
+  }
 }

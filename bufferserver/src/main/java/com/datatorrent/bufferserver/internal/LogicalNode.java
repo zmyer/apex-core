@@ -32,8 +32,8 @@ import com.datatorrent.bufferserver.policy.Policy;
 import com.datatorrent.bufferserver.util.BitVector;
 import com.datatorrent.bufferserver.util.Codec;
 import com.datatorrent.bufferserver.util.SerializedData;
-import com.datatorrent.netlet.AbstractLengthPrependerClient;
 import com.datatorrent.netlet.EventLoop;
+import com.datatorrent.netlet.WriteOnlyClient;
 
 /**
  * LogicalNode represents a logical node in a DAG<p>
@@ -54,6 +54,7 @@ public class LogicalNode implements DataListener
   private final Policy policy = GiveAll.getInstance();
   private final DataListIterator iterator;
   private final long skipWindowId;
+  private final EventLoop eventloop;
   private long baseSeconds;
   private boolean caughtup;
 
@@ -65,15 +66,16 @@ public class LogicalNode implements DataListener
    * @param iterator
    * @param skipWindowId
    */
-  public LogicalNode(String identifier, String upstream, String group, DataListIterator iterator, long skipWindowId)
+  public LogicalNode(String identifier, String upstream, String group, DataListIterator iterator, long skipWindowId, EventLoop eventloop)
   {
     this.identifier = identifier;
     this.upstream = upstream;
     this.group = group;
-    this.physicalNodes = new HashSet<PhysicalNode>();
-    this.partitions = new HashSet<BitVector>();
+    this.physicalNodes = new HashSet<>();
+    this.partitions = new HashSet<>();
     this.iterator = iterator;
     this.skipWindowId = skipWindowId;
+    this.eventloop = eventloop;
   }
 
   /**
@@ -99,7 +101,7 @@ public class LogicalNode implements DataListener
    *
    * @param connection
    */
-  public void addConnection(AbstractLengthPrependerClient connection)
+  public void addConnection(WriteOnlyClient connection)
   {
     PhysicalNode pn = new PhysicalNode(connection);
     if (!physicalNodes.contains(pn)) {
@@ -111,7 +113,7 @@ public class LogicalNode implements DataListener
    *
    * @param client
    */
-  public void removeChannel(AbstractLengthPrependerClient client)
+  public void removeChannel(WriteOnlyClient client)
   {
     for (PhysicalNode pn : physicalNodes) {
       if (pn.getClient() == client) {
@@ -138,9 +140,7 @@ public class LogicalNode implements DataListener
     if (!ready) {
       ready = true;
       for (PhysicalNode pn : physicalNodes) {
-        if (pn.isBlocked()) {
-          ready = pn.unblock() & ready;
-        }
+        ready = pn.unblock() & ready;
       }
     }
 
@@ -151,7 +151,7 @@ public class LogicalNode implements DataListener
   /**
    *
    */
-  public void catchUp()
+  private void catchUp()
   {
     caughtup = false;
     if (isReady()) {
@@ -215,12 +215,13 @@ public class LogicalNode implements DataListener
                   physicalNodes);
           }
         }
-      } catch (InterruptedException ie) {
-        throw new RuntimeException(ie);
+      } catch (Exception e) {
+        logger.error("Disconnecting {}", this, e);
+        boot();
       }
 
       if (iterator.hasNext()) {
-        addedData();
+        addedData(false);
       }
     }
 
@@ -228,9 +229,9 @@ public class LogicalNode implements DataListener
   }
 
   @Override
-  public boolean addedData()
+  public boolean addedData(boolean checkIfListenerHaveDataToSendOnly)
   {
-    if (isReady()) {
+    if (!checkIfListenerHaveDataToSendOnly && isReady()) {
       if (caughtup) {
         try {
           /*
@@ -293,14 +294,15 @@ public class LogicalNode implements DataListener
               }
             }
           }
-        } catch (InterruptedException ie) {
-          throw new RuntimeException(ie);
+        } catch (Exception e) {
+          logger.error("Disconnecting {}", this, e);
+          boot();
         }
       } else {
         catchUp();
       }
     }
-    return !ready;
+    return iterator.hasNext();
   }
 
   /**
@@ -341,7 +343,7 @@ public class LogicalNode implements DataListener
     return identifier;
   }
 
-  public void boot(EventLoop eventloop)
+  public void boot()
   {
     for (PhysicalNode pn : physicalNodes) {
       eventloop.disconnect(pn.getClient());

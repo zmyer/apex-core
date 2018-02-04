@@ -33,6 +33,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import org.apache.apex.log.LogFileInformation;
+
 import org.apache.commons.lang3.SerializationUtils;
 import org.apache.hadoop.fs.FileContext;
 import org.apache.hadoop.fs.Path;
@@ -81,6 +84,7 @@ public class StramLocalCluster implements Runnable, Controller
   private final Map<String, StreamingContainer> injectShutdown = new ConcurrentHashMap<>();
   private boolean heartbeatMonitoringEnabled = true;
   private Callable<Boolean> exitCondition;
+  private Thread master;
 
   public interface MockComponentFactory
   {
@@ -105,13 +109,9 @@ public class StramLocalCluster implements Runnable, Controller
     }
 
     @Override
-    public void reportError(String containerId, int[] operators, String msg)
+    public void reportError(String containerId, int[] operators, String msg, LogFileInformation logFileInfo) throws IOException
     {
-      try {
-        log(containerId, msg);
-      } catch (IOException ex) {
-        // ignore
-      }
+      log(containerId, msg);
     }
 
     @Override
@@ -131,11 +131,11 @@ public class StramLocalCluster implements Runnable, Controller
     }
 
     @Override
-    public ContainerHeartbeatResponse processHeartbeat(ContainerHeartbeat msg)
+    public ContainerHeartbeatResponse processHeartbeat(ContainerHeartbeat msg) throws IOException
     {
       if (injectShutdown.containsKey(msg.getContainerId())) {
         ContainerHeartbeatResponse r = new ContainerHeartbeatResponse();
-        r.shutdown = true;
+        r.shutdown = ShutdownType.ABORT;
         return r;
       }
       try {
@@ -404,13 +404,32 @@ public class StramLocalCluster implements Runnable, Controller
   @Override
   public void runAsync()
   {
-    new Thread(this, "master").start();
+    master = new Thread(this, "master");
+    master.start();
   }
 
   @Override
   public void shutdown()
   {
     appDone = true;
+    awaitTermination(0);
+  }
+
+  private void awaitTermination(long millis)
+  {
+    if (master != null) {
+      try {
+        master.interrupt();
+        master.join(millis);
+      } catch (InterruptedException e) {
+        throw new RuntimeException(e);
+      } finally {
+        if (master.isAlive()) {
+          LOG.warn("{} {} did not terminate.", this.getClass().getSimpleName(), master.getName());
+        }
+        master = null;
+      }
+    }
   }
 
   public boolean isFinished()
@@ -434,6 +453,17 @@ public class StramLocalCluster implements Runnable, Controller
     this.exitCondition = exitCondition;
   }
 
+  public void run(Callable<Boolean> exitCondition)
+  {
+    run(exitCondition, 0);
+  }
+
+  public void run(Callable<Boolean> exitCondition, long runMillis)
+  {
+    setExitCondition(exitCondition);
+    run(runMillis);
+  }
+
   @Override
   public void run()
   {
@@ -444,100 +474,127 @@ public class StramLocalCluster implements Runnable, Controller
   @SuppressWarnings({"SleepWhileInLoop", "ResultOfObjectAllocationIgnored"})
   public void run(long runMillis)
   {
-    if (!perContainerBufferServer) {
-      StreamingContainer.eventloop.start();
-      bufferServer = new Server(0, 1024 * 1024,8);
-      try {
-        bufferServer.setSpoolStorage(new DiskStorage());
-      } catch (IOException e) {
-        throw new RuntimeException(e);
-      }
-      bufferServerAddress = InetSocketAddress.createUnresolved(LOCALHOST, bufferServer.run(StreamingContainer.eventloop).getPort());
-      LOG.info("Buffer server started: {}", bufferServerAddress);
-    }
-
-    long endMillis = System.currentTimeMillis() + runMillis;
+    Thread eventLoopThread = null;
     List<Thread> containerThreads = new LinkedList<>();
-
-    while (!appDone) {
-
-      for (String containerIdStr: dnmgr.containerStopRequests.values()) {
-        // teardown child thread
-        StreamingContainer c = childContainers.get(containerIdStr);
-        if (c != null) {
-          ContainerHeartbeatResponse r = new ContainerHeartbeatResponse();
-          r.shutdown = true;
-          c.processHeartbeatResponse(r);
+    try {
+      if (!perContainerBufferServer) {
+        eventLoopThread = StreamingContainer.eventloop.start();
+        bufferServer = new Server(StreamingContainer.eventloop, 0, 1024 * 1024, 8);
+        try {
+          bufferServer.setSpoolStorage(new DiskStorage());
+        } catch (IOException e) {
+          throw new RuntimeException(e);
         }
-        dnmgr.containerStopRequests.remove(containerIdStr);
-        LOG.info("Container {} restart.", containerIdStr);
-        dnmgr.scheduleContainerRestart(containerIdStr);
-        //dnmgr.removeContainerAgent(containerIdStr);
+        bufferServerAddress = InetSocketAddress.createUnresolved(LOCALHOST, bufferServer.run().getPort());
+        LOG.info("Buffer server started: {}", bufferServerAddress);
       }
 
-      // start containers
-      while (!dnmgr.containerStartRequests.isEmpty()) {
-        ContainerStartRequest cdr = dnmgr.containerStartRequests.poll();
-        if (cdr != null) {
-          new LocalStreamingContainerLauncher(cdr, containerThreads);
+      long endMillis = System.currentTimeMillis() + runMillis;
+
+      while (!appDone) {
+
+        for (String containerIdStr : dnmgr.containerStopRequests.values()) {
+          // teardown child thread
+          StreamingContainer c = childContainers.get(containerIdStr);
+          if (c != null) {
+            ContainerHeartbeatResponse r = new ContainerHeartbeatResponse();
+            r.shutdown = StreamingContainerUmbilicalProtocol.ShutdownType.ABORT;
+            c.processHeartbeatResponse(r);
+          }
+          dnmgr.containerStopRequests.remove(containerIdStr);
+          LOG.info("Container {} restart.", containerIdStr);
+          dnmgr.scheduleContainerRestart(containerIdStr);
+          //dnmgr.removeContainerAgent(containerIdStr);
         }
-      }
 
-      if (heartbeatMonitoringEnabled) {
-        // monitor child containers
-        dnmgr.monitorHeartbeat();
-      }
+        // start containers
+        while (!dnmgr.containerStartRequests.isEmpty()) {
+          ContainerStartRequest cdr = dnmgr.containerStartRequests.poll();
+          if (cdr != null) {
+            new LocalStreamingContainerLauncher(cdr, containerThreads);
+          }
+        }
 
-      if (childContainers.isEmpty() && dnmgr.containerStartRequests.isEmpty()) {
-        appDone = true;
-      }
+        if (heartbeatMonitoringEnabled) {
+          // monitor child containers
+          dnmgr.monitorHeartbeat(false);
+        }
 
-      if (runMillis > 0 && System.currentTimeMillis() > endMillis) {
-        appDone = true;
-      }
-
-      try {
-        if (exitCondition != null && exitCondition.call()) {
+        if (childContainers.isEmpty() && dnmgr.containerStartRequests.isEmpty()) {
           appDone = true;
         }
-      } catch (Exception ex) {
-        break;
-      }
 
-      if (Thread.interrupted()) {
-        break;
-      }
+        if (runMillis > 0 && System.currentTimeMillis() > endMillis) {
+          appDone = true;
+        }
 
-      if (!appDone) {
         try {
-          Thread.sleep(1000);
-        } catch (InterruptedException e) {
-          LOG.info("Sleep interrupted " + e.getMessage());
+          if (exitCondition != null && exitCondition.call()) {
+            LOG.info("Stopping on exit condition");
+            appDone = true;
+          }
+        } catch (Exception ex) {
           break;
+        }
+
+        if (Thread.interrupted()) {
+          break;
+        }
+
+        if (!appDone) {
+          try {
+            Thread.sleep(1000);
+          } catch (InterruptedException e) {
+            LOG.debug("Sleep interrupted", e);
+            break;
+          }
+        }
+      }
+    } finally {
+      for (LocalStreamingContainer lsc : childContainers.values()) {
+        injectShutdown.put(lsc.getContainerId(), lsc);
+        lsc.triggerHeartbeat();
+      }
+
+      for (Thread thread : containerThreads) {
+        try {
+          thread.join(1000);
+        } catch (InterruptedException e) {
+          LOG.debug("Wait for {} to terminate interrupted", thread, e);
+        }
+        if (thread.isAlive()) {
+          LOG.warn("Container thread {} is still alive", thread.getName());
+        }
+      }
+
+      try {
+        dnmgr.teardown();
+      } catch (RuntimeException e) {
+        LOG.warn("Exception during StreamingContainerManager teardown", e);
+      }
+
+      if (bufferServerAddress != null) {
+        try {
+          bufferServer.stop();
+        } catch (RuntimeException e) {
+          LOG.warn("Exception during BufferServer stop", e);
+        }
+      }
+
+      if (eventLoopThread != null) {
+        try {
+          StreamingContainer.eventloop.stop();
+          eventLoopThread.join(1000);
+        } catch (InterruptedException ie) {
+          LOG.debug("Wait for {} to terminate interrupted", eventLoopThread.getName(), ie);
+        } catch (RuntimeException e) {
+          LOG.warn("Exception during {} stop", StreamingContainer.eventloop, e);
+        }
+        if (StreamingContainer.eventloop.isActive()) {
+          LOG.warn("Event loop {} is still active", StreamingContainer.eventloop);
         }
       }
     }
-
-    for (LocalStreamingContainer lsc: childContainers.values()) {
-      injectShutdown.put(lsc.getContainerId(), lsc);
-      lsc.triggerHeartbeat();
-    }
-
-    for (Thread thread: containerThreads) {
-      try {
-        thread.join(1000);
-      } catch (InterruptedException e) {
-        LOG.warn("Container thread didn't finish {}", thread.getName());
-      }
-    }
-
-    dnmgr.teardown();
-
     LOG.info("Application finished.");
-    if (!perContainerBufferServer) {
-      StreamingContainer.eventloop.stop(bufferServer);
-      StreamingContainer.eventloop.stop();
-    }
   }
-
 }

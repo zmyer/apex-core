@@ -65,6 +65,13 @@ import org.codehaus.jettison.json.JSONObject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.apex.engine.api.plugin.DAGExecutionEvent;
+import org.apache.apex.engine.events.grouping.GroupingManager;
+import org.apache.apex.engine.events.grouping.GroupingRequest.EventGroupId;
+import org.apache.apex.engine.plugin.ApexPluginDispatcher;
+import org.apache.apex.engine.plugin.NoOpApexPluginDispatcher;
+import org.apache.apex.engine.util.CascadeStorageAgent;
+import org.apache.apex.engine.util.PubSubWebSocketClientBuilder;
 import org.apache.commons.io.IOUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.builder.ToStringBuilder;
@@ -80,6 +87,9 @@ import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.yarn.api.ApplicationConstants;
+import org.apache.hadoop.yarn.api.records.ContainerId;
+import org.apache.hadoop.yarn.api.records.ContainerReport;
+import org.apache.hadoop.yarn.client.api.YarnClient;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
 import org.apache.hadoop.yarn.util.Clock;
 import org.apache.hadoop.yarn.util.SystemClock;
@@ -134,6 +144,7 @@ import com.datatorrent.stram.api.StreamingContainerUmbilicalProtocol.ContainerHe
 import com.datatorrent.stram.api.StreamingContainerUmbilicalProtocol.ContainerHeartbeatResponse;
 import com.datatorrent.stram.api.StreamingContainerUmbilicalProtocol.ContainerStats;
 import com.datatorrent.stram.api.StreamingContainerUmbilicalProtocol.OperatorHeartbeat;
+import com.datatorrent.stram.api.StreamingContainerUmbilicalProtocol.ShutdownType;
 import com.datatorrent.stram.api.StreamingContainerUmbilicalProtocol.StramToNodeRequest;
 import com.datatorrent.stram.api.StreamingContainerUmbilicalProtocol.StreamingContainerContext;
 import com.datatorrent.stram.engine.OperatorResponse;
@@ -163,7 +174,6 @@ import com.datatorrent.stram.util.ConfigUtils;
 import com.datatorrent.stram.util.FSJsonLineFile;
 import com.datatorrent.stram.util.MovingAverage.MovingAverageLong;
 import com.datatorrent.stram.util.SharedPubSubWebSocketClient;
-import com.datatorrent.stram.util.WebServicesClient;
 import com.datatorrent.stram.webapp.ContainerInfo;
 import com.datatorrent.stram.webapp.LogicalOperatorInfo;
 import com.datatorrent.stram.webapp.OperatorAggregationInfo;
@@ -188,7 +198,6 @@ import net.engio.mbassy.bus.config.BusConfiguration;
 public class StreamingContainerManager implements PlanContext
 {
   private static final Logger LOG = LoggerFactory.getLogger(StreamingContainerManager.class);
-  public static final String GATEWAY_LOGIN_URL_PATH = "/ws/v2/login";
   public static final String BUILTIN_APPDATA_URL = "builtin";
   public static final String CONTAINERS_INFO_FILENAME_FORMAT = "containers_%d.json";
   public static final String OPERATORS_INFO_FILENAME_FORMAT = "operators_%d.json";
@@ -230,6 +239,7 @@ public class StreamingContainerManager implements PlanContext
   private final ConcurrentSkipListMap<Long, Map<Integer, EndWindowStats>> endWindowStatsOperatorMap = new ConcurrentSkipListMap<>();
   private final ConcurrentMap<PTOperator, PTOperator> slowestUpstreamOp = new ConcurrentHashMap<>();
   private long committedWindowId;
+  private long lastCommittedWindowId = Checkpoint.INITIAL_CHECKPOINT.getWindowId();
   // (operator id, port name) to timestamp
   private final Map<Pair<Integer, String>, Long> operatorPortLastEndWindowTimestamps = Maps.newConcurrentMap();
   private final Map<Integer, Long> operatorLastEndWindowTimestamps = Maps.newConcurrentMap();
@@ -251,6 +261,8 @@ public class StreamingContainerManager implements PlanContext
 
   //logical operator name to latest counters. exists for backward compatibility.
   private final Map<String, Object> latestLogicalCounters = Maps.newHashMap();
+  public transient ApexPluginDispatcher apexPluginDispatcher = new NoOpApexPluginDispatcher();
+  private final GroupingManager groupingManager = GroupingManager.getGroupingManagerInstance();
 
   private final LinkedHashMap<String, ContainerInfo> completedContainers = new LinkedHashMap<String, ContainerInfo>()
   {
@@ -478,11 +490,12 @@ public class StreamingContainerManager implements PlanContext
         String nodeHttpAddress = nmHost + ":" + nmHttpPort;
         if (allocatedMemoryMB == 0) {
           String url = ConfigUtils.getSchemePrefix(conf) + nodeHttpAddress + "/ws/v1/node/containers/" + ci.id;
-          WebServicesClient webServicesClient = new WebServicesClient();
-          try {
-            String content = webServicesClient.process(url, String.class, new WebServicesClient.GetWebServicesHandler<String>());
-            JSONObject json = new JSONObject(content);
-            int totalMemoryNeededMB = json.getJSONObject("container").getInt("totalMemoryNeededMB");
+          try (YarnClient rmClient = YarnClient.createYarnClient()) {
+            rmClient.init(conf);
+            rmClient.start();
+            ContainerReport content = rmClient.getContainerReport(ContainerId.fromString(ci.id));
+            int totalMemoryNeededMB = content.getAllocatedResource().getMemory();
+            LOG.debug("App Master allocated memory is {}", totalMemoryNeededMB);
             if (totalMemoryNeededMB > 0) {
               allocatedMemoryMB = totalMemoryNeededMB;
             } else {
@@ -543,23 +556,12 @@ public class StreamingContainerManager implements PlanContext
 
   private void setupWsClient()
   {
-    String gatewayAddress = plan.getLogicalPlan().getValue(LogicalPlan.GATEWAY_CONNECT_ADDRESS);
-    boolean gatewayUseSsl = plan.getLogicalPlan().getValue(LogicalPlan.GATEWAY_USE_SSL);
-    String gatewayUserName = plan.getLogicalPlan().getValue(LogicalPlan.GATEWAY_USER_NAME);
-    String gatewayPassword = plan.getLogicalPlan().getValue(LogicalPlan.GATEWAY_PASSWORD);
-    int timeout = plan.getLogicalPlan().getValue(LogicalPlan.PUBSUB_CONNECT_TIMEOUT_MILLIS);
-
-    if (gatewayAddress != null) {
+    wsClient = new PubSubWebSocketClientBuilder().setContext(plan.getLogicalPlan()).build();
+    if (wsClient != null) {
       try {
-        wsClient = new SharedPubSubWebSocketClient((gatewayUseSsl ? "wss://" : "ws://") + gatewayAddress + "/pubsub", timeout);
-        if (gatewayUserName != null && gatewayPassword != null) {
-          wsClient.setLoginUrl((gatewayUseSsl ? "https://" : "http://") + gatewayAddress + GATEWAY_LOGIN_URL_PATH);
-          wsClient.setUserName(gatewayUserName);
-          wsClient.setPassword(gatewayPassword);
-        }
-        wsClient.setup();
-      } catch (Exception ex) {
-        LOG.warn("Cannot establish websocket connection to {}", gatewayAddress, ex);
+        wsClient.openConnection();
+      } catch (Exception e) {
+        LOG.warn("Cannot establish websocket connection to uri {}", wsClient.getUri(), e);
       }
     }
   }
@@ -705,7 +707,7 @@ public class StreamingContainerManager implements PlanContext
               appDataSource.setQueryOperatorName(queryOperatorName);
               appDataSource.setQueryTopic(queryTopic);
               appDataSource.setQueryUrl(convertAppDataUrl(queryUrl));
-              List<LogicalPlan.InputPortMeta> sinks = entry.getValue().getSinks();
+              Collection<LogicalPlan.InputPortMeta> sinks = entry.getValue().getSinks();
               if (sinks.isEmpty()) {
                 LOG.warn("There is no result operator for the App Data Source {}.{}. Ignoring the App Data Source.", operatorMeta.getName(), portMeta.getPortName());
                 continue;
@@ -714,7 +716,7 @@ public class StreamingContainerManager implements PlanContext
                 LOG.warn("There are multiple result operators for the App Data Source {}.{}. Ignoring the App Data Source.", operatorMeta.getName(), portMeta.getPortName());
                 continue;
               }
-              OperatorMeta resultOperatorMeta = sinks.get(0).getOperatorWrapper();
+              OperatorMeta resultOperatorMeta = sinks.iterator().next().getOperatorMeta();
               if (resultOperatorMeta.getOperator() instanceof AppData.ConnectionInfoProvider) {
                 AppData.ConnectionInfoProvider resultOperator = (AppData.ConnectionInfoProvider)resultOperatorMeta.getOperator();
                 appDataSource.setResultOperatorName(resultOperatorMeta.getName());
@@ -748,7 +750,7 @@ public class StreamingContainerManager implements PlanContext
    * Check periodically that deployed containers phone home.
    * Run from the master main loop (single threaded access).
    */
-  public void monitorHeartbeat()
+  public void monitorHeartbeat(boolean waitForRecovery)
   {
     long currentTms = clock.getTime();
 
@@ -761,7 +763,7 @@ public class StreamingContainerManager implements PlanContext
         for (PTContainer c : pendingAllocation) {
           LOG.warn("Waiting for resource: {}m priority: {} {}", c.getRequiredMemoryMB(), c.getResourceRequestPriority(), c);
         }
-        shutdownAllContainers(msg);
+        shutdownAllContainers(ShutdownType.ABORT, msg);
         this.forcedShutdown = true;
       } else {
         for (PTContainer c : pendingAllocation) {
@@ -779,14 +781,22 @@ public class StreamingContainerManager implements PlanContext
           //LOG.debug("{} {} {}", c.getExternalId(), currentTms - sca.createdMillis, this.vars.heartbeatTimeoutMillis);
           // container allocated but process was either not launched or is not able to phone home
           if (currentTms - sca.createdMillis > 2 * this.vars.heartbeatTimeoutMillis) {
-            LOG.info("Container {}@{} startup timeout ({} ms).", c.getExternalId(), c.host, currentTms - sca.createdMillis);
+            LOG.warn("Container {}@{} startup timeout ({} ms).", c.getExternalId(), c.host, currentTms - sca.createdMillis);
             containerStopRequests.put(c.getExternalId(), c.getExternalId());
           }
         } else {
           if (currentTms - sca.lastHeartbeatMillis > this.vars.heartbeatTimeoutMillis) {
             if (!isApplicationIdle()) {
+              // Check if the heartbeat for this agent has already been missed to raise the StramEvent only once
+              if (sca.lastHeartbeatMillis != -1) {
+                String msg = String.format("Container %s@%s heartbeat timeout  (%d%n ms).", c.getExternalId(), c.host, currentTms - sca.lastHeartbeatMillis);
+                LOG.warn(msg);
+                StramEvent stramEvent = new StramEvent.ContainerErrorEvent(c.getExternalId(), msg, null, null);
+                stramEvent.setReason(msg);
+                recordEventAsync(stramEvent);
+                sca.lastHeartbeatMillis = -1;
+              }
               // request stop (kill) as process may still be hanging around (would have been detected by Yarn otherwise)
-              LOG.info("Container {}@{} heartbeat timeout ({} ms).", c.getExternalId(), c.host, currentTms - sca.lastHeartbeatMillis);
               containerStopRequests.put(c.getExternalId(), c.getExternalId());
             }
           }
@@ -797,7 +807,11 @@ public class StreamingContainerManager implements PlanContext
     // events that may modify the plan
     processEvents();
 
-    committedWindowId = updateCheckpoints(false);
+    committedWindowId = updateCheckpoints(waitForRecovery);
+    if (lastCommittedWindowId != committedWindowId) {
+      apexPluginDispatcher.dispatch(new DAGExecutionEvent.CommitExecutionEvent(committedWindowId));
+      lastCommittedWindowId = committedWindowId;
+    }
     calculateEndWindowStats();
     if (this.vars.enableStatsRecording) {
       recordStats(currentTms);
@@ -1121,7 +1135,7 @@ public class StreamingContainerManager implements PlanContext
   public void scheduleContainerRestart(String containerId)
   {
     StreamingContainerAgent cs = this.getContainerAgent(containerId);
-    if (cs == null || cs.shutdownRequested) {
+    if (cs == null || cs.isShutdownRequested()) {
       // the container is no longer used / was released by us
       return;
     }
@@ -1137,9 +1151,12 @@ public class StreamingContainerManager implements PlanContext
     // resolve dependencies
     UpdateCheckpointsContext ctx = new UpdateCheckpointsContext(clock, false, getCheckpointGroups());
     for (PTOperator oper : cs.container.getOperators()) {
-      updateRecoveryCheckpoints(oper, ctx);
+      updateRecoveryCheckpoints(oper, ctx, false);
     }
     includeLocalUpstreamOperators(ctx);
+
+    groupingManager.addOrModifyGroupingRequest(containerId, ctx.visited);
+    groupingManager.removeProcessedGroupingRequests();
 
     // redeploy cycle for all affected operators
     LOG.info("Affected operators {}", ctx.visited);
@@ -1169,7 +1186,7 @@ public class StreamingContainerManager implements PlanContext
       }
       if (!newOperators.isEmpty()) {
         for (PTOperator oper : newOperators) {
-          updateRecoveryCheckpoints(oper, ctx);
+          updateRecoveryCheckpoints(oper, ctx, false);
         }
       }
     } while (!newOperators.isEmpty());
@@ -1182,7 +1199,7 @@ public class StreamingContainerManager implements PlanContext
     if (containerAgent != null) {
       // record operator stop for this container
       for (PTOperator oper : containerAgent.container.getOperators()) {
-        StramEvent ev = new StramEvent.StopOperatorEvent(oper.getName(), oper.getId(), containerId);
+        StramEvent ev = new StramEvent.StopOperatorEvent(oper.getName(), oper.getId(), containerId, groupingManager.getEventGroupIdForContainer(containerId));
         recordEventAsync(ev);
       }
       containerAgent.container.setFinishedTime(System.currentTimeMillis());
@@ -1256,6 +1273,8 @@ public class StreamingContainerManager implements PlanContext
       LOG.debug("Containers waiting for allocation {}", pendingAllocation);
       return null;
     }
+
+    groupingManager.addNewContainerToGroupingRequest(container.getExternalId(), resource.containerId);
 
     pendingAllocation.remove(container);
     container.setState(PTContainer.State.ALLOCATED);
@@ -1355,16 +1374,20 @@ public class StreamingContainerManager implements PlanContext
                 }
                 deactivatedOpers.add(oper);
               }
+              oper.setState(State.INACTIVE);
               sca.undeployOpers.add(oper.getId());
               slowestUpstreamOp.remove(oper);
               // record operator stop event
-              recordEventAsync(new StramEvent.StopOperatorEvent(oper.getName(), oper.getId(), oper.getContainer().getExternalId()));
+              recordEventAsync(new StramEvent.StopOperatorEvent(oper.getName(), oper.getId(), oper.getContainer().getExternalId(), null));
               break;
             case FAILED:
               processOperatorFailure(oper);
               sca.undeployOpers.add(oper.getId());
               slowestUpstreamOp.remove(oper);
-              recordEventAsync(new StramEvent.StopOperatorEvent(oper.getName(), oper.getId(), oper.getContainer().getExternalId()));
+
+              EventGroupId groupId = groupingManager.getEventGroupIdForContainer(oper.getContainer().getExternalId());
+              recordEventAsync(new StramEvent.StopOperatorEvent(oper.getName(), oper.getId(),
+                  oper.getContainer().getExternalId(), groupId));
               break;
             case ACTIVE:
             default:
@@ -1374,8 +1397,9 @@ public class StreamingContainerManager implements PlanContext
         break;
       case PENDING_UNDEPLOY:
         if (ds == null) {
+          EventGroupId groupId = groupingManager.moveOperatorFromUndeployListToDeployList(oper);
           // operator no longer deployed in container
-          recordEventAsync(new StramEvent.StopOperatorEvent(oper.getName(), oper.getId(), oper.getContainer().getExternalId()));
+          recordEventAsync(new StramEvent.StopOperatorEvent(oper.getName(), oper.getId(), oper.getContainer().getExternalId(), groupId));
           oper.setState(State.PENDING_DEPLOY);
           sca.deployOpers.add(oper);
         } else {
@@ -1395,7 +1419,9 @@ public class StreamingContainerManager implements PlanContext
           oper.setState(PTOperator.State.ACTIVE);
           oper.stats.lastHeartbeat = null; // reset on redeploy
           oper.stats.lastWindowIdChangeTms = clock.getTime();
-          recordEventAsync(new StramEvent.StartOperatorEvent(oper.getName(), oper.getId(), container.getExternalId()));
+          EventGroupId groupId = groupingManager.getEventGroupIdForOperatorToDeploy(oper.getId());
+          recordEventAsync(new StramEvent.StartOperatorEvent(oper.getName(), oper.getId(), container.getExternalId(),  groupId));
+          groupingManager.removeOperatorFromGroupingRequest(oper.getId());
         }
         break;
       default:
@@ -1404,7 +1430,7 @@ public class StreamingContainerManager implements PlanContext
           // operator was removed and needs to be undeployed from container
           sca.undeployOpers.add(oper.getId());
           slowestUpstreamOp.remove(oper);
-          recordEventAsync(new StramEvent.StopOperatorEvent(oper.getName(), oper.getId(), oper.getContainer().getExternalId()));
+          recordEventAsync(new StramEvent.StopOperatorEvent(oper.getName(), oper.getId(), oper.getContainer().getExternalId(), null));
         }
     }
   }
@@ -1428,7 +1454,7 @@ public class StreamingContainerManager implements PlanContext
       } else {
         String msg = String.format("Shutdown after reaching failure threshold for %s", oper);
         LOG.warn(msg);
-        shutdownAllContainers(msg);
+        shutdownAllContainers(ShutdownType.ABORT, msg);
         forcedShutdown = true;
       }
     } else {
@@ -1454,7 +1480,7 @@ public class StreamingContainerManager implements PlanContext
       // could be orphaned container that was replaced and needs to terminate
       LOG.error("Unknown container {}", heartbeat.getContainerId());
       ContainerHeartbeatResponse response = new ContainerHeartbeatResponse();
-      response.shutdown = true;
+      response.shutdown = ShutdownType.ABORT;
       return response;
     }
 
@@ -1771,11 +1797,11 @@ public class StreamingContainerManager implements PlanContext
 
     if (heartbeat.getContainerStats().operators.isEmpty() && isApplicationIdle()) {
       LOG.info("requesting idle shutdown for container {}", heartbeat.getContainerId());
-      rsp.shutdown = true;
+      rsp.shutdown = ShutdownType.ABORT;
     } else {
-      if (sca.shutdownRequested) {
+      if (sca.isShutdownRequested()) {
         LOG.info("requesting shutdown for container {}", heartbeat.getContainerId());
-        rsp.shutdown = true;
+        rsp.shutdown = sca.shutdownRequest;
       }
     }
 
@@ -1793,6 +1819,7 @@ public class StreamingContainerManager implements PlanContext
     rsp.stackTraceRequired = sca.stackTraceRequested;
     sca.stackTraceRequested = false;
 
+    apexPluginDispatcher.dispatch(new DAGExecutionEvent.HeartbeatExecutionEvent(heartbeat));
     return rsp;
   }
 
@@ -2021,7 +2048,7 @@ public class StreamingContainerManager implements PlanContext
    * @param operator Operator instance for which to find recovery checkpoint
    * @param ctx      Context into which to collect traversal info
    */
-  public void updateRecoveryCheckpoints(PTOperator operator, UpdateCheckpointsContext ctx)
+  public void updateRecoveryCheckpoints(PTOperator operator, UpdateCheckpointsContext ctx, boolean recovery)
   {
     if (operator.getRecoveryCheckpoint().windowId < ctx.committedWindowId.longValue()) {
       ctx.committedWindowId.setValue(operator.getRecoveryCheckpoint().windowId);
@@ -2030,7 +2057,7 @@ public class StreamingContainerManager implements PlanContext
     if (operator.getState() == PTOperator.State.ACTIVE &&
         (ctx.currentTms - operator.stats.lastWindowIdChangeTms) > operator.stats.windowProcessingTimeoutMillis) {
       // if the checkpoint is ahead, then it is not blocked but waiting for activation (state-less recovery, at-most-once)
-      if (ctx.committedWindowId.longValue() >= operator.getRecoveryCheckpoint().windowId) {
+      if (ctx.committedWindowId.longValue() >= operator.getRecoveryCheckpoint().windowId && !recovery) {
         LOG.warn("Marking operator {} blocked committed window {}, recovery window {}, current time {}, last window id change time {}, window processing timeout millis {}",
             operator,
             Codec.getStringWindowId(ctx.committedWindowId.longValue()),
@@ -2059,6 +2086,8 @@ public class StreamingContainerManager implements PlanContext
     if (checkpointGroup.size() > 1) {
       for (OperatorMeta om : checkpointGroup) {
         Collection<PTOperator> operators = plan.getAllOperators(om);
+        Collection<PTOperator> unifiers = getUnifiersInCheckpointGroup(operators);
+        operators.addAll(unifiers);
         for (PTOperator groupOper : operators) {
           synchronized (groupOper.checkpoints) {
             commonCheckpoints.retainAll(groupOper.checkpoints);
@@ -2095,7 +2124,7 @@ public class StreamingContainerManager implements PlanContext
           }
           if (!ctx.visited.contains(sinkOperator)) {
             // downstream traversal
-            updateRecoveryCheckpoints(sinkOperator, ctx);
+            updateRecoveryCheckpoints(sinkOperator, ctx, recovery);
           }
           // recovery window id cannot move backwards
           // when dynamically adding new operators
@@ -2152,6 +2181,22 @@ public class StreamingContainerManager implements PlanContext
 
   }
 
+  private static Collection<PTOperator> getUnifiersInCheckpointGroup(Collection<PTOperator> operators)
+  {
+    Set<PTOperator> unifiers = Sets.newHashSet();
+    for (PTOperator op : operators) {
+      for (PTOperator.PTOutput out : op.getOutputs()) {
+        for (PTOperator.PTInput in : out.sinks) {
+          PTOperator target = in.target;
+          if (target.isUnifier()) {
+            unifiers.add(target);
+          }
+        }
+      }
+    }
+    return unifiers;
+  }
+
   public long windowIdToMillis(long windowId)
   {
     int widthMillis = plan.getLogicalPlan().getValue(LogicalPlan.STREAMING_WINDOW_SIZE_MILLIS);
@@ -2163,7 +2208,7 @@ public class StreamingContainerManager implements PlanContext
     return this.vars.windowStartMillis;
   }
 
-  private Map<OperatorMeta, Set<OperatorMeta>> getCheckpointGroups()
+  protected Map<OperatorMeta, Set<OperatorMeta>> getCheckpointGroups()
   {
     if (this.checkpointGroups == null) {
       this.checkpointGroups = new HashMap<>();
@@ -2191,12 +2236,11 @@ public class StreamingContainerManager implements PlanContext
     int operatorCount = 0;
     UpdateCheckpointsContext ctx = new UpdateCheckpointsContext(clock, recovery, getCheckpointGroups());
     for (OperatorMeta logicalOperator : plan.getLogicalPlan().getRootOperators()) {
-      //LOG.debug("Updating checkpoints for operator {}", logicalOperator.getName());
       List<PTOperator> operators = plan.getOperators(logicalOperator);
       if (operators != null) {
         for (PTOperator operator : operators) {
           operatorCount++;
-          updateRecoveryCheckpoints(operator, ctx);
+          updateRecoveryCheckpoints(operator, ctx, recovery);
         }
       }
     }
@@ -2257,14 +2301,15 @@ public class StreamingContainerManager implements PlanContext
    * If containers don't respond, the application can be forcefully terminated
    * via yarn using forceKillApplication.
    *
+   * @param type
    * @param message
    */
-  public void shutdownAllContainers(String message)
+  public void shutdownAllContainers(ShutdownType type, String message)
   {
     this.shutdownDiagnosticsMessage = message;
-    LOG.info("Initiating application shutdown: {}", message);
+    LOG.info("Initiating application shutdown: type {} {}", type, message);
     for (StreamingContainerAgent cs : this.containers.values()) {
-      cs.shutdownRequested = true;
+      cs.requestShutDown(type);
     }
   }
 
@@ -2290,6 +2335,27 @@ public class StreamingContainerManager implements PlanContext
     lastResourceRequest = System.currentTimeMillis();
     for (PTOperator operator : c.getOperators()) {
       operator.setState(PTOperator.State.INACTIVE);
+    }
+  }
+
+  public void deployAfterRestart()
+  {
+    if (startedFromCheckpoint) {
+      try {
+        this.deployChangeInProgress.set(true);
+
+        for (PTContainer c : getPhysicalPlan().getContainers()) {
+          c.setState(PTContainer.State.NEW);
+          requestContainer(c);
+
+          for (PTOperator ptOperator : c.getOperators()) {
+            ptOperator.setState(State.PENDING_DEPLOY);
+          }
+        }
+      } finally {
+        this.deployChangeCnt++;
+        this.deployChangeInProgress.set(false);
+      }
     }
   }
 
@@ -2329,8 +2395,8 @@ public class StreamingContainerManager implements PlanContext
             for (PTOperator.PTOutput out : operator.getOutputs()) {
               if (!out.isDownStreamInline()) {
                 for (InputPortMeta ipm : out.logicalStream.getSinks()) {
-                  StreamCodec<?> streamCodecInfo = StreamingContainerAgent.getStreamCodec(ipm);
-                  Integer codecId = plan.getStreamCodecIdentifier(streamCodecInfo);
+                  StreamCodec<?> streamCodec = ipm.getStreamCodec();
+                  Integer codecId = plan.getStreamCodecIdentifier(streamCodec);
                   // following needs to match the concat logic in StreamingContainer
                   String sourceIdentifier = Integer.toString(operator.getId()).concat(Component.CONCAT_SEPARATOR).concat(out.portName).concat(Component.CONCAT_SEPARATOR).concat(codecId.toString());
                   if (operator.getContainer().getState() == PTContainer.State.ACTIVE) {
@@ -2358,6 +2424,7 @@ public class StreamingContainerManager implements PlanContext
           // operator will be deployed after it has been undeployed, if still referenced by the container
           if (oper.getState() != PTOperator.State.PENDING_UNDEPLOY) {
             oper.setState(PTOperator.State.PENDING_DEPLOY);
+            groupingManager.addOperatorToDeploy(oper.getContainer().getExternalId(), oper);
           }
         }
       }
@@ -2372,7 +2439,7 @@ public class StreamingContainerManager implements PlanContext
           LOG.debug("Container marked for shutdown: {}", c);
           // container already removed from plan
           // TODO: monitor soft shutdown
-          sca.shutdownRequested = true;
+          sca.requestShutDown(ShutdownType.ABORT);
         }
       }
 
@@ -2385,6 +2452,7 @@ public class StreamingContainerManager implements PlanContext
   @Override
   public void recordEventAsync(StramEvent ev)
   {
+    apexPluginDispatcher.dispatch(new DAGExecutionEvent.StramExecutionEvent(ev));
     if (eventBus != null) {
       eventBus.publishAsync(ev);
     }
@@ -3018,6 +3086,7 @@ public class StreamingContainerManager implements PlanContext
         recordEventAsync(new StramEvent.ChangeLogicalPlanEvent(request));
       }
       pm.applyChanges(StreamingContainerManager.this);
+      apexPluginDispatcher.dispatch(new ApexPluginDispatcher.DAGChangeEvent(plan.getLogicalPlan()));
       LOG.info("Plan changes applied: {}", requests);
       return null;
     }
@@ -3107,6 +3176,7 @@ public class StreamingContainerManager implements PlanContext
             scm.requestContainer(c);
           }
         }
+        scm.startedFromCheckpoint = true;
       }
       scm.recoveryHandler = rh;
       scm.checkpoint();
@@ -3115,6 +3185,8 @@ public class StreamingContainerManager implements PlanContext
       throw new IllegalStateException("Failed to read checkpointed state", e);
     }
   }
+
+  private boolean startedFromCheckpoint = false;
 
   private static class FinalVars implements java.io.Serializable
   {
@@ -3191,23 +3263,43 @@ public class StreamingContainerManager implements PlanContext
 
       this.finals = new FinalVars(finals, lp);
       StorageAgent sa = lp.getValue(OperatorContext.STORAGE_AGENT);
-      if (sa instanceof AsyncFSStorageAgent) {
-        // replace the default storage agent, if present
-        AsyncFSStorageAgent fssa = (AsyncFSStorageAgent)sa;
-        if (fssa.path.contains(oldAppId)) {
-          fssa = new AsyncFSStorageAgent(fssa.path.replace(oldAppId, appId), conf);
-          lp.setAttribute(OperatorContext.STORAGE_AGENT, fssa);
-        }
-      } else if (sa instanceof FSStorageAgent) {
-        // replace the default storage agent, if present
-        FSStorageAgent fssa = (FSStorageAgent)sa;
-        if (fssa.path.contains(oldAppId)) {
-          fssa = new FSStorageAgent(fssa.path.replace(oldAppId, appId), conf);
-          lp.setAttribute(OperatorContext.STORAGE_AGENT, fssa);
-        }
+      lp.setAttribute(OperatorContext.STORAGE_AGENT, updateStorageAgent(sa, oldAppId, appId, conf));
+    }
+  }
+
+  private static StorageAgent updateStorageAgent(StorageAgent sa, String oldAppId, String appId, Configuration conf)
+  {
+    if (sa instanceof AsyncFSStorageAgent || sa instanceof FSStorageAgent) {
+      FSStorageAgent newAgent = (FSStorageAgent)updateFSStorageAgent(sa, oldAppId, appId, conf);
+      if (newAgent != sa) {
+        return new CascadeStorageAgent(sa, newAgent);
+      }
+    } else if (sa instanceof CascadeStorageAgent) {
+      CascadeStorageAgent csa = (CascadeStorageAgent)sa;
+      StorageAgent currentStorageAgent = csa.getCurrentStorageAgent();
+      return new CascadeStorageAgent(csa, updateFSStorageAgent(currentStorageAgent, oldAppId, appId, conf));
+    }
+    return sa;
+  }
+
+  /**
+   * Return updated FileSystem based storage agent. Storage agent is updated only when
+   * they use application directory to store the checkpoints.
+   */
+  private static StorageAgent updateFSStorageAgent(StorageAgent sa, String oldAppId, String appId, Configuration conf)
+  {
+    if (sa instanceof AsyncFSStorageAgent) {
+      AsyncFSStorageAgent fssa = (AsyncFSStorageAgent)sa;
+      if (fssa.path.contains(oldAppId)) {
+        return new AsyncFSStorageAgent(fssa.path.replace(oldAppId, appId), conf);
+      }
+    } else if (sa instanceof FSStorageAgent) {
+      FSStorageAgent fssa = (FSStorageAgent)sa;
+      if (fssa.path.contains(oldAppId)) {
+        return new FSStorageAgent(fssa.path.replace(oldAppId, appId), conf);
       }
     }
-
+    return sa;
   }
 
   public interface RecoveryHandler
@@ -3290,4 +3382,8 @@ public class StreamingContainerManager implements PlanContext
     return latestLogicalCounters.get(operatorName);
   }
 
+  public void setApexPluginDispatcher(ApexPluginDispatcher manager)
+  {
+    this.apexPluginDispatcher = manager;
+  }
 }

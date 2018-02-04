@@ -693,7 +693,7 @@ submitted to the Hadoop cluster and executes as a  multi-processapplication on 
 
 
 Before you start deploying, testing and troubleshooting your
-application on a cluster, you should ensure that Hadoop (version 2.2.0
+application on a cluster, you should ensure that Hadoop (version 2.6.0
 or later) is properly installed and
 you have basic skills for working with it.
 
@@ -917,8 +917,8 @@ educate the reader on Hadoop, but just get the reader acquainted with
 the terms. We strongly advise readers to learn Hadoop from other
 sources.
 
-A streaming application runs as a native Hadoop 2.2 application.
-Hadoop 2.2 does not differentiate between a map-reduce job and other
+A streaming application runs as a native Hadoop 2.x application.
+Hadoop 2.x does not differentiate between a map-reduce job and other
 applications, and hence as far as Hadoop is concerned, the streaming
 application is just another job. This means that your application
 leverages all the bells and whistles Hadoop provides and is fully
@@ -937,9 +937,9 @@ Hadoop.
 ### YARN
 
 [YARN](http://hadoop.apache.org/docs/current/hadoop-yarn/hadoop-yarn-site)is
-the core library of Hadoop 2.2 that is tasked with resource management
+the core library of Hadoop 2.x that is tasked with resource management
 and works as a distributed application framework. In this section we
-will walk through Yarn's components. In Hadoop 2.2, the old jobTracker
+will walk through Yarn's components. In Hadoop 2.x, the old jobTracker
 has been replaced by a combination of ResourceManager (RM) and
 ApplicationMaster (AM).
 
@@ -962,8 +962,8 @@ interacting with NodeManagers to get the allocated containers started.
 The AM is the starting point of your application and is considered user
 code (not system Hadoop code). The AM itself runs in one container. All
 resource management within the application are managed by the AM. This
-is a critical feature for Hadoop 2.2 where tasks done by jobTracker in
-Hadoop 1.0 have been distributed allowing Hadoop 2.2 to scale much
+is a critical feature for Hadoop 2.x where tasks done by jobTracker in
+Hadoop 1.0 have been distributed allowing Hadoop 2.x to scale much
 beyond Hadoop 1.0. STRAM is a native YARN ApplicationManager.
 
 #### Node Managers (NM)
@@ -1255,15 +1255,15 @@ For example `myApplication.properties`
 
 ```
 # input operator that reads from a file
-dt.operator.inputOp.classname=com.acme.SampleInputOperator
-dt.operator.inputOp.fileName=somefile.txt
+apex.operator.inputOp.classname=com.acme.SampleInputOperator
+apex.operator.inputOp.fileName=somefile.txt
 
 # output operator that writes to the console
-dt.operator.outputOp.classname=com.acme.ConsoleOutputOperator
+apex.operator.outputOp.classname=com.acme.ConsoleOutputOperator
 
 # stream connecting both operators
-dt.stream.inputStream.source=inputOp.outputPort
-dt.stream.inputStream.sinks=outputOp.inputPort
+apex.stream.inputStream.source=inputOp.outputPort
+apex.stream.inputStream.sinks=outputOp.inputPort
 ```
 
 
@@ -1776,7 +1776,7 @@ The last configurable parameter for affinity rules is strict or preferred rule. 
 The same set of rules can also be added from properties.xml by setting value for attribute DAGContext.AFFINITY_RULES_SET as JSON string.  For example:
 ```xml
 <property>
-    <name>dt.application.AffinityRulesSampleApplication.attr.AFFINITY_RULES_SET</name>
+    <name>apex.application.AffinityRulesSampleApplication.attr.AFFINITY_RULES_SET</name>
     <value>
     {
       "affinityRules": [
@@ -2077,7 +2077,7 @@ approaches can be used in combination.
 The platform does not make assumptions about the tuple
 type, it could be any Java object. The operator developer knows what
 tuple type an input port expects and is capable of processing. Each
-input port has a stream codec  associated thatdefines how data is serialized when transmitted over a socket
+input port has a stream codec  associated that defines how data is serialized when transmitted over a socket
 stream; it also defines another
 function that computes the partition hash key for the tuple. The engine
 uses that key to determine which physical instance(s)  (for a

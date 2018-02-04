@@ -42,6 +42,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.apex.log.LogFileInformation;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.lang.exception.ExceptionUtils;
 import org.apache.hadoop.conf.Configuration;
@@ -154,7 +155,7 @@ public class StreamingContainer extends YarnContainerMain
   private long firstWindowMillis;
   private int windowWidthMillis;
   protected InetSocketAddress bufferServerAddress;
-  protected com.datatorrent.bufferserver.server.Server bufferServer;
+  protected Server bufferServer;
   private int checkpointWindowCount;
   private boolean fastPublisherSubscriber;
   private StreamingContainerContext containerContext;
@@ -223,12 +224,12 @@ public class StreamingContainer extends YarnContainerMain
           blockCount = bufferServerRAM / blocksize;
         }
         // start buffer server, if it was not set externally
-        bufferServer = new Server(0, blocksize * 1024 * 1024, blockCount);
+        bufferServer = new Server(eventloop, 0, blocksize * 1024 * 1024, blockCount);
         bufferServer.setAuthToken(ctx.getValue(StreamingContainerContext.BUFFER_SERVER_TOKEN));
         if (ctx.getValue(Context.DAGContext.BUFFER_SPOOLING)) {
           bufferServer.setSpoolStorage(new DiskStorage());
         }
-        bufferServerAddress = NetUtils.getConnectAddress(bufferServer.run(eventloop));
+        bufferServerAddress = NetUtils.getConnectAddress(bufferServer.run());
         logger.debug("Buffer server started: {}", bufferServerAddress);
       }
     } catch (IOException ex) {
@@ -285,6 +286,7 @@ public class StreamingContainer extends YarnContainerMain
    */
   public static void main(String[] args) throws Throwable
   {
+    LoggerUtil.setupMDC("worker");
     StdOutErrLog.tieSystemOutAndErrToLog();
     logger.debug("PID: " + System.getenv().get("JVM_PID"));
     logger.info("Child starting with classpath: {}", System.getProperty("java.class.path"));
@@ -297,10 +299,12 @@ public class StreamingContainer extends YarnContainerMain
 
     int exitStatus = 1; // interpreted as unrecoverable container failure
 
-    RecoverableRpcProxy rpcProxy = new RecoverableRpcProxy(appPath, new Configuration());
-    final StreamingContainerUmbilicalProtocol umbilical = rpcProxy.getProxy();
+    RecoverableRpcProxy rpcProxy = null;
+    StreamingContainerUmbilicalProtocol umbilical = null;
     final String childId = System.getProperty(StreamingApplication.DT_PREFIX + "cid");
     try {
+      rpcProxy = new RecoverableRpcProxy(appPath, new Configuration());
+      umbilical = rpcProxy.getProxy();
       StreamingContainerContext ctx = umbilical.getInitContext(childId);
       StreamingContainer stramChild = new StreamingContainer(childId, umbilical);
       logger.debug("Container Context = {}", ctx);
@@ -312,25 +316,25 @@ public class StreamingContainer extends YarnContainerMain
       } finally {
         stramChild.teardown();
       }
-    } catch (Error error) {
-      logger.error("Fatal error in container!", error);
+    } catch (Error | Exception e) {
+      LogFileInformation logFileInfo = LoggerUtil.getLogFileInformation();
+      logger.error("Fatal {} in container!", (e instanceof Error) ? "Error" : "Exception", e);
       /* Report back any failures, for diagnostic purposes */
-      String msg = ExceptionUtils.getStackTrace(error);
-      umbilical.reportError(childId, null, "FATAL: " + msg);
-    } catch (Exception exception) {
-      logger.error("Fatal exception in container!", exception);
-      /* Report back any failures, for diagnostic purposes */
-      String msg = ExceptionUtils.getStackTrace(exception);
-      umbilical.reportError(childId, null, msg);
+      try {
+        umbilical.reportError(childId, null, ExceptionUtils.getStackTrace(e), logFileInfo);
+      } catch (Exception ex) {
+        logger.debug("Fail to log", ex);
+      }
     } finally {
-      rpcProxy.close();
+      if (rpcProxy != null) {
+        rpcProxy.close();
+      }
       DefaultMetricsSystem.shutdown();
       logger.info("Exit status for container: {}", exitStatus);
       LogManager.shutdown();
-    }
-
-    if (exitStatus != 0) {
-      System.exit(exitStatus);
+      if (exitStatus != 0) {
+        System.exit(exitStatus);
+      }
     }
   }
 
@@ -585,7 +589,7 @@ public class StreamingContainer extends YarnContainerMain
     }
 
     if (bufferServer != null) {
-      eventloop.stop(bufferServer);
+      bufferServer.stop();
       eventloop.stop();
     }
 
@@ -601,8 +605,8 @@ public class StreamingContainer extends YarnContainerMain
 
   public void heartbeatLoop() throws Exception
   {
-    umbilical.log(containerId, "[" + containerId + "] Entering heartbeat loop..");
     logger.debug("Entering heartbeat loop (interval is {} ms)", this.heartbeatIntervalMillis);
+    umbilical.log(containerId, "[" + containerId + "] Entering heartbeat loop..");
     final YarnConfiguration conf = new YarnConfiguration();
     long tokenLifeTime = (long)(containerContext.getValue(LogicalPlan.TOKEN_REFRESH_ANTICIPATORY_FACTOR) * containerContext.getValue(LogicalPlan.HDFS_TOKEN_LIFE_TIME));
     long expiryTime = System.currentTimeMillis();
@@ -718,7 +722,7 @@ public class StreamingContainer extends YarnContainerMain
       } while (rsp.hasPendingRequests);
 
     }
-    logger.debug("Exiting hearbeat loop");
+    logger.debug("[{}] Exiting heartbeat loop", containerId);
     umbilical.log(containerId, "[" + containerId + "] Exiting heartbeat loop..");
   }
 
@@ -807,11 +811,15 @@ public class StreamingContainer extends YarnContainerMain
       undeploy(rsp.undeployRequest);
     }
 
-    if (rsp.shutdown) {
-      logger.info("Received shutdown request");
-      processNodeRequests(false);
-      this.exitHeartbeatLoop = true;
-      return;
+    if (rsp.shutdown != null) {
+      logger.info("Received shutdown request type {}", rsp.shutdown);
+      if (rsp.shutdown == StreamingContainerUmbilicalProtocol.ShutdownType.ABORT) {
+        processNodeRequests(false);
+        this.exitHeartbeatLoop = true;
+        return;
+      } else if (rsp.shutdown == StreamingContainerUmbilicalProtocol.ShutdownType.WAIT_TERMINATE) {
+        stopInputNodes();
+      }
     }
 
     if (rsp.deployRequest != null) {
@@ -823,7 +831,7 @@ public class StreamingContainer extends YarnContainerMain
         try {
           umbilical.log(this.containerId, "deploy request failed: " + rsp.deployRequest + " " + ExceptionUtils.getStackTrace(e));
         } catch (IOException ioe) {
-          // ignore
+          logger.debug("Fail to log", ioe);
         }
         this.exitHeartbeatLoop = true;
         throw new IllegalStateException("Deploy request failed: " + rsp.deployRequest, e);
@@ -831,6 +839,20 @@ public class StreamingContainer extends YarnContainerMain
     }
 
     processNodeRequests(true);
+  }
+
+  private void stopInputNodes()
+  {
+    for (Entry<Integer, Node<?>> e : nodes.entrySet()) {
+      Node<?> node = e.getValue();
+      if (node instanceof InputNode) {
+        final Thread thread = e.getValue().context.getThread();
+        if (thread == null || !thread.isAlive()) {
+          continue;
+        }
+        node.shutdown(true);
+      }
+    }
   }
 
   private int getOutputQueueCapacity(List<OperatorDeployInfo> operatorList, int sourceOperatorId, String sourcePortName)
@@ -1407,6 +1429,8 @@ public class StreamingContainer extends YarnContainerMain
             node.run(); /* this is a blocking call */
           } catch (Error error) {
             int[] operators;
+            //fetch logFileInfo before logging exception, to get offset before exception
+            LogFileInformation logFileInfo = LoggerUtil.getLogFileInformation();
             if (currentdi == null) {
               logger.error("Voluntary container termination due to an error in operator set {}.", setOperators, error);
               operators = new int[setOperators.size()];
@@ -1418,19 +1442,34 @@ public class StreamingContainer extends YarnContainerMain
               logger.error("Voluntary container termination due to an error in operator {}.", currentdi, error);
               operators = new int[]{currentdi.id};
             }
-            umbilical.reportError(containerId, operators, "Voluntary container termination due to an error. " + ExceptionUtils.getStackTrace(error));
-            System.exit(1);
+            try {
+              umbilical.reportError(containerId, operators, "Voluntary container termination due to an error. " + ExceptionUtils.getStackTrace(error), logFileInfo);
+            } catch (Exception e) {
+              logger.debug("Fail to log", e);
+            } finally {
+              System.exit(1);
+            }
           } catch (Exception ex) {
+            //fetch logFileInfo before logging exception, to get offset before exception
+            LogFileInformation logFileInfo = LoggerUtil.getLogFileInformation();
             if (currentdi == null) {
               failedNodes.add(ndi.id);
               logger.error("Operator set {} stopped running due to an exception.", setOperators, ex);
               int[] operators = new int[]{ndi.id};
-              umbilical.reportError(containerId, operators, "Stopped running due to an exception. " + ExceptionUtils.getStackTrace(ex));
+              try {
+                umbilical.reportError(containerId, operators, "Stopped running due to an exception. " + ExceptionUtils.getStackTrace(ex), logFileInfo);
+              } catch (Exception e) {
+                logger.debug("Fail to log", e);
+              }
             } else {
               failedNodes.add(currentdi.id);
               logger.error("Abandoning deployment of operator {} due to setup failure.", currentdi, ex);
               int[] operators = new int[]{currentdi.id};
-              umbilical.reportError(containerId, operators, "Abandoning deployment due to setup failure. " + ExceptionUtils.getStackTrace(ex));
+              try {
+                umbilical.reportError(containerId, operators, "Abandoning deployment due to setup failure. " + ExceptionUtils.getStackTrace(ex), logFileInfo);
+              } catch (Exception e) {
+                logger.debug("Fail to log", e);
+              }
             }
           } finally {
             if (setOperators.contains(ndi)) {
@@ -1460,6 +1499,13 @@ public class StreamingContainer extends YarnContainerMain
         }
       };
       node.context.setThread(thread);
+      List<Integer> oioNodeIdList = oioGroups.get(ndi.id);
+      if (oioNodeIdList != null) {
+        for (Integer oioNodeId : oioNodeIdList) {
+          Node<?> oioNode = nodes.get(oioNodeId);
+          oioNode.context.setThread(thread);
+        }
+      }
       thread.start();
     }
 

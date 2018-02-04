@@ -18,8 +18,12 @@
  */
 package com.datatorrent.stram.client;
 
+import java.io.Closeable;
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -34,10 +38,17 @@ import java.util.jar.Attributes;
 import java.util.jar.JarFile;
 import java.util.jar.Manifest;
 
+import org.codehaus.jackson.JsonGenerator;
+import org.codehaus.jackson.JsonProcessingException;
+import org.codehaus.jackson.map.JsonSerializer;
+import org.codehaus.jackson.map.SerializerProvider;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.commons.compress.archivers.zip.ZipArchiveEntry;
+import org.apache.commons.compress.archivers.zip.ZipArchiveInputStream;
 import org.apache.commons.io.FileUtils;
+import org.apache.commons.io.IOUtils;
 import org.apache.commons.lang.exception.ExceptionUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.conf.Configuration;
@@ -56,7 +67,7 @@ import net.lingala.zip4j.model.ZipParameters;
  *
  * @since 1.0.3
  */
-public class AppPackage extends JarFile
+public class AppPackage implements Closeable
 {
   public static final String ATTRIBUTE_DT_ENGINE_VERSION = "DT-Engine-Version";
   public static final String ATTRIBUTE_DT_APP_PACKAGE_NAME = "DT-App-Package-Name";
@@ -81,7 +92,7 @@ public class AppPackage extends JarFile
   private final List<String> appPropertiesFiles = new ArrayList<>();
 
   private final Set<String> requiredProperties = new TreeSet<>();
-  private final Map<String, String> defaultProperties = new TreeMap<>();
+  private final Map<String, PropertyInfo> defaultProperties = new TreeMap<>();
   private final Set<String> configs = new TreeSet<>();
 
   private final File resourcesDirectory;
@@ -98,7 +109,7 @@ public class AppPackage extends JarFile
     public String errorStackTrace;
 
     public Set<String> requiredProperties = new TreeSet<>();
-    public Map<String, String> defaultProperties = new TreeMap<>();
+    public Map<String, PropertyInfo> defaultProperties = new TreeMap<>();
 
     public AppInfo(String name, String file, String type)
     {
@@ -109,9 +120,61 @@ public class AppPackage extends JarFile
 
   }
 
-  public AppPackage(File file) throws IOException, ZipException
+  public static class PropertyInfo
   {
-    this(file, false);
+    private final String value;
+    private final String description;
+
+    public PropertyInfo(final String value, final String description)
+    {
+      this.value = value;
+      this.description = description;
+    }
+
+    public String getValue()
+    {
+      return value;
+    }
+
+    public String getDescription()
+    {
+      return description;
+    }
+  }
+
+  public static class PropertyInfoSerializer extends JsonSerializer<PropertyInfo>
+  {
+    private boolean provideDescription;
+
+    public PropertyInfoSerializer(boolean provideDescription)
+    {
+      this.provideDescription = provideDescription;
+    }
+
+    @Override
+    public void serialize(
+        PropertyInfo propertyInfo, JsonGenerator jgen, SerializerProvider provider)
+      throws IOException, JsonProcessingException
+    {
+      if (provideDescription) {
+        jgen.writeStartObject();
+        jgen.writeStringField("value", propertyInfo.value);
+        jgen.writeStringField("description", propertyInfo.description);
+        jgen.writeEndObject();
+      } else {
+        jgen.writeString(propertyInfo.value);
+      }
+    }
+  }
+
+  public AppPackage(File file) throws IOException
+  {
+    this(new FileInputStream(file));
+  }
+
+  public AppPackage(InputStream input) throws IOException
+  {
+    this(input, false);
   }
 
   /**
@@ -127,52 +190,71 @@ public class AppPackage extends JarFile
    * @param contentFolder  the folder that the app package will be extracted to
    * @param processAppDirectory
    * @throws java.io.IOException
-   * @throws net.lingala.zip4j.exception.ZipException
    */
-  public AppPackage(File file, File contentFolder, boolean processAppDirectory) throws IOException, ZipException
+  public AppPackage(File file, File contentFolder, boolean processAppDirectory) throws IOException
   {
-    super(file);
+    this(new FileInputStream(file), contentFolder, processAppDirectory);
+  }
 
-    if (contentFolder != null) {
-      FileUtils.forceMkdir(contentFolder);
-      cleanOnClose = false;
-    } else {
-      cleanOnClose = true;
-      contentFolder = Files.createTempDirectory("dt-appPackage-").toFile();
-    }
-    directory = contentFolder;
+  /**
+   * Creates an App Package object.
+   *
+   * If app directory is to be processed, there may be resource leak in the class loader. Only pass true for short-lived
+   * applications
+   *
+   * If contentFolder is not null, it will try to create the contentFolder, file will be retained on disk after App Package is closed
+   * If contentFolder is null, temp folder will be created and will be cleaned on close()
+   *
+   * @param input
+   * @param contentFolder  the folder that the app package will be extracted to
+   * @param processAppDirectory
+   * @throws java.io.IOException
+   */
+  public AppPackage(InputStream input, File contentFolder, boolean processAppDirectory) throws IOException
+  {
+    try (final ZipArchiveInputStream zipArchiveInputStream =
+        new ZipArchiveInputStream(input, "UTF8", true, true)) {
 
-    Manifest manifest = getManifest();
-    if (manifest == null) {
-      throw new IOException("Not a valid app package. MANIFEST.MF is not present.");
-    }
-    Attributes attr = manifest.getMainAttributes();
-    appPackageName = attr.getValue(ATTRIBUTE_DT_APP_PACKAGE_NAME);
-    appPackageVersion = attr.getValue(ATTRIBUTE_DT_APP_PACKAGE_VERSION);
-    appPackageGroupId = attr.getValue(ATTRIBUTE_DT_APP_PACKAGE_GROUP_ID);
-    dtEngineVersion = attr.getValue(ATTRIBUTE_DT_ENGINE_VERSION);
-    appPackageDisplayName = attr.getValue(ATTRIBUTE_DT_APP_PACKAGE_DISPLAY_NAME);
-    appPackageDescription = attr.getValue(ATTRIBUTE_DT_APP_PACKAGE_DESCRIPTION);
-    String classPathString = attr.getValue(ATTRIBUTE_CLASS_PATH);
-    if (appPackageName == null || appPackageVersion == null || classPathString == null) {
-      throw new IOException("Not a valid app package.  App Package Name or Version or Class-Path is missing from MANIFEST.MF");
-    }
-    classPath.addAll(Arrays.asList(StringUtils.split(classPathString, " ")));
-    extractToDirectory(directory, file);
+      if (contentFolder != null) {
+        FileUtils.forceMkdir(contentFolder);
+        cleanOnClose = false;
+      } else {
+        cleanOnClose = true;
+        contentFolder = Files.createTempDirectory("dt-appPackage-").toFile();
+      }
+      directory = contentFolder;
 
-    File confDirectory = new File(directory, "conf");
-    if (confDirectory.exists()) {
-      processConfDirectory(confDirectory);
-    }
-    resourcesDirectory = new File(directory, "resources");
+      Manifest manifest = extractToDirectory(directory, zipArchiveInputStream);
+      if (manifest == null) {
+        throw new IOException("Not a valid app package. MANIFEST.MF is not present.");
+      }
+      Attributes attr = manifest.getMainAttributes();
+      appPackageName = attr.getValue(ATTRIBUTE_DT_APP_PACKAGE_NAME);
+      appPackageVersion = attr.getValue(ATTRIBUTE_DT_APP_PACKAGE_VERSION);
+      appPackageGroupId = attr.getValue(ATTRIBUTE_DT_APP_PACKAGE_GROUP_ID);
+      dtEngineVersion = attr.getValue(ATTRIBUTE_DT_ENGINE_VERSION);
+      appPackageDisplayName = attr.getValue(ATTRIBUTE_DT_APP_PACKAGE_DISPLAY_NAME);
+      appPackageDescription = attr.getValue(ATTRIBUTE_DT_APP_PACKAGE_DESCRIPTION);
+      String classPathString = attr.getValue(ATTRIBUTE_CLASS_PATH);
+      if (appPackageName == null || appPackageVersion == null || classPathString == null) {
+        throw new IOException("Not a valid app package.  App Package Name or Version or Class-Path is missing from MANIFEST.MF");
+      }
+      classPath.addAll(Arrays.asList(StringUtils.split(classPathString, " ")));
 
-    File propertiesXml = new File(directory, "META-INF/properties.xml");
-    if (propertiesXml.exists()) {
-      processPropertiesXml(propertiesXml, null);
-    }
+      File confDirectory = new File(directory, "conf");
+      if (confDirectory.exists()) {
+        processConfDirectory(confDirectory);
+      }
+      resourcesDirectory = new File(directory, "resources");
 
-    if (processAppDirectory) {
-      processAppDirectory(false);
+      File propertiesXml = new File(directory, "META-INF/properties.xml");
+      if (propertiesXml.exists()) {
+        processPropertiesXml(propertiesXml, null);
+      }
+
+      if (processAppDirectory) {
+        processAppDirectory(false);
+      }
     }
   }
 
@@ -200,23 +282,61 @@ public class AppPackage extends JarFile
    * @param file
    * @param processAppDirectory
    * @throws java.io.IOException
-   * @throws net.lingala.zip4j.exception.ZipException
    */
-  public AppPackage(File file, boolean processAppDirectory) throws IOException, ZipException
+  public AppPackage(File file, boolean processAppDirectory) throws IOException
   {
-    this(file, null, processAppDirectory);
+    this(new FileInputStream(file), processAppDirectory);
   }
 
-  public static void extractToDirectory(File directory, File appPackageFile) throws ZipException
+  /**
+   * Creates an App Package object.
+   *
+   * If app directory is to be processed, there may be resource leak in the class loader. Only pass true for short-lived
+   * applications
+   *
+   * Files in app package will be extracted to tmp folder and will be cleaned on close()
+   * The close() method could be explicitly called or implicitly called by GC finalize()
+   *
+   * @param input
+   * @param processAppDirectory
+   * @throws java.io.IOException
+   */
+  public AppPackage(InputStream input, boolean processAppDirectory) throws IOException
   {
-    ZipFile zipFile = new ZipFile(appPackageFile);
+    this(input, null, processAppDirectory);
+  }
 
-    if (zipFile.isEncrypted()) {
-      throw new ZipException("Encrypted app package not supported yet");
+  public static void extractToDirectory(File directory, File appPackageFile) throws IOException
+  {
+    extractToDirectory(directory, new ZipArchiveInputStream(new FileInputStream(appPackageFile), "UTF-8", true, true));
+  }
+
+  private static Manifest extractToDirectory(File directory, ZipArchiveInputStream input) throws IOException
+  {
+    Manifest manifest = null;
+    File manifestFile = new File(directory, JarFile.MANIFEST_NAME);
+    manifestFile.getParentFile().mkdirs();
+
+    ZipArchiveEntry entry = input.getNextZipEntry();
+    while (entry != null) {
+      File newFile = new File(directory, entry.getName());
+      if (entry.isDirectory()) {
+        newFile.mkdirs();
+      } else {
+        if (JarFile.MANIFEST_NAME.equals(entry.getName())) {
+          manifest = new Manifest(input);
+          try (FileOutputStream output = new FileOutputStream(newFile)) {
+            manifest.write(output);
+          }
+        } else {
+          try (FileOutputStream output = new FileOutputStream(newFile)) {
+            IOUtils.copy(input, output);
+          }
+        }
+      }
+      entry = input.getNextZipEntry();
     }
-
-    directory.mkdirs();
-    zipFile.extractAll(directory.getAbsolutePath());
+    return manifest;
   }
 
   public static void createAppPackageFile(File fileToBeCreated, File directory) throws ZipException
@@ -235,7 +355,6 @@ public class AppPackage extends JarFile
   @Override
   public void close() throws IOException
   {
-    super.close();
     if (cleanOnClose) {
       cleanContent();
     }
@@ -317,7 +436,7 @@ public class AppPackage extends JarFile
     return Collections.unmodifiableSet(requiredProperties);
   }
 
-  public Map<String, String> getDefaultProperties()
+  public Map<String, PropertyInfo> getDefaultProperties()
   {
     return Collections.unmodifiableMap(defaultProperties);
   }
@@ -328,6 +447,10 @@ public class AppPackage extends JarFile
     applications.clear();
 
     Configuration config = new Configuration();
+
+    for (Map.Entry<String, PropertyInfo> entry : defaultProperties.entrySet()) {
+      config.set(entry.getKey(), entry.getValue().getValue());
+    }
 
     List<String> absClassPath = new ArrayList<>(classPath);
     for (int i = 0; i < absClassPath.size(); i++) {
@@ -342,8 +465,9 @@ public class AppPackage extends JarFile
 
       if (entry.getName().endsWith(".jar") && !skipJars) {
         appJars.add(entry.getName());
+        StramAppLauncher stramAppLauncher = null;
         try {
-          StramAppLauncher stramAppLauncher = new StramAppLauncher(entry, config);
+          stramAppLauncher = new StramAppLauncher(entry, config);
           stramAppLauncher.loadDependencies();
           List<AppFactory> appFactories = stramAppLauncher.getBundledTopologies();
           for (AppFactory appFactory : appFactories) {
@@ -355,7 +479,6 @@ public class AppPackage extends JarFile
             appInfo.displayName = appFactory.getDisplayName();
             try {
               appInfo.dag = appFactory.createApp(stramAppLauncher.getLogicalPlanConfiguration());
-              appInfo.dag.validate();
             } catch (Throwable ex) {
               appInfo.error = ex.getMessage();
               appInfo.errorStackTrace = ExceptionUtils.getStackTrace(ex);
@@ -364,6 +487,10 @@ public class AppPackage extends JarFile
           }
         } catch (Exception ex) {
           LOG.error("Caught exception trying to process {}", entry.getName(), ex);
+        } finally {
+          if (stramAppLauncher != null) {
+            stramAppLauncher.resetContextClassLoader();
+          }
         }
       }
     }
@@ -394,7 +521,6 @@ public class AppPackage extends JarFile
           appInfo.displayName = appFactory.getDisplayName();
           try {
             appInfo.dag = appFactory.createApp(stramAppLauncher.getLogicalPlanConfiguration());
-            appInfo.dag.validate();
           } catch (Throwable t) {
             appInfo.error = t.getMessage();
             appInfo.errorStackTrace = ExceptionUtils.getStackTrace(t);
@@ -436,11 +562,14 @@ public class AppPackage extends JarFile
             app.requiredProperties.add(key);
           }
         } else {
+        //Attribute are platform specific, ignoring description provided in properties file
+          String description = key.contains(".attr.") ? null : config.getDescription(key);
+          PropertyInfo propertyInfo = new PropertyInfo(value, description);
           if (app == null) {
-            defaultProperties.put(key, value);
+            defaultProperties.put(key, propertyInfo);
           } else {
             app.requiredProperties.remove(key);
-            app.defaultProperties.put(key, value);
+            app.defaultProperties.put(key, propertyInfo);
           }
         }
       }

@@ -48,6 +48,7 @@ import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.apex.common.util.AsyncStorageAgent;
 import org.apache.hadoop.util.ReflectionUtils;
 
 import com.google.common.base.Throwables;
@@ -70,7 +71,6 @@ import com.datatorrent.api.StatsListener;
 import com.datatorrent.api.StatsListener.OperatorRequest;
 import com.datatorrent.api.StorageAgent;
 import com.datatorrent.bufferserver.util.Codec;
-import com.datatorrent.common.util.AsyncFSStorageAgent;
 import com.datatorrent.common.util.Pair;
 import com.datatorrent.stram.api.Checkpoint;
 import com.datatorrent.stram.api.OperatorDeployInfo;
@@ -317,9 +317,18 @@ public abstract class Node<OPERATOR extends Operator> implements Component<Opera
   protected ProcessingMode PROCESSING_MODE;
   protected volatile boolean shutdown;
 
-  public void shutdown()
+  /**
+   * Shutdown the current node.
+   * If processEndWindow is set to true, then after shutting down, endWindow is called and
+   * END_STREAM tuple is sent to downstream operators.
+   *
+   * @param processEndWindow
+   */
+  public void shutdown(boolean processEndWindow)
   {
-    shutdown = true;
+    if (!processEndWindow) {
+      shutdown = true;
+    }
 
     synchronized (this) {
       alive = false;
@@ -345,6 +354,11 @@ public abstract class Node<OPERATOR extends Operator> implements Component<Opera
     }
   }
 
+  public void shutdown()
+  {
+    shutdown(false);
+  }
+
   @Override
   public String toString()
   {
@@ -353,7 +367,7 @@ public abstract class Node<OPERATOR extends Operator> implements Component<Opera
 
   protected void emitEndStream()
   {
-    // logger.debug("{} sending EndOfStream", this);
+    logger.info("{} sending EndOfStream", this);
     /*
      * since we are going away, we should let all the downstream operators know that.
      */
@@ -505,16 +519,16 @@ public abstract class Node<OPERATOR extends Operator> implements Component<Opera
           checkpointStats = new Stats.CheckpointStats();
           checkpointStats.checkpointStartTime = System.currentTimeMillis();
           ba.save(operator, id, windowId);
-          if (ba instanceof AsyncFSStorageAgent) {
-            AsyncFSStorageAgent asyncFSStorageAgent = (AsyncFSStorageAgent)ba;
-            if (!asyncFSStorageAgent.isSyncCheckpoint()) {
+          if (ba instanceof AsyncStorageAgent) {
+            AsyncStorageAgent asyncStorageAgent = (AsyncStorageAgent)ba;
+            if (!asyncStorageAgent.isSyncCheckpoint()) {
               if (PROCESSING_MODE != ProcessingMode.EXACTLY_ONCE) {
                 CheckpointWindowInfo checkpointWindowInfo = new CheckpointWindowInfo();
                 checkpointWindowInfo.windowId = windowId;
                 checkpointWindowInfo.applicationWindowCount = applicationWindowCount;
                 checkpointWindowInfo.checkpointWindowCount = checkpointWindowCount;
                 CheckpointHandler checkpointHandler = new CheckpointHandler();
-                checkpointHandler.agent = asyncFSStorageAgent;
+                checkpointHandler.agent = asyncStorageAgent;
                 checkpointHandler.operatorId = id;
                 checkpointHandler.windowId = windowId;
                 checkpointHandler.stats = checkpointStats;
@@ -525,7 +539,7 @@ public abstract class Node<OPERATOR extends Operator> implements Component<Opera
                 checkpointStats = null;
                 return;
               } else {
-                asyncFSStorageAgent.copyToHDFS(id, windowId);
+                asyncStorageAgent.flush(id, windowId);
               }
             }
           }
@@ -666,8 +680,7 @@ public abstract class Node<OPERATOR extends Operator> implements Component<Opera
 
   private class CheckpointHandler implements Callable<Stats.CheckpointStats>
   {
-
-    public AsyncFSStorageAgent agent;
+    public AsyncStorageAgent agent;
     public int operatorId;
     public long windowId;
     public Stats.CheckpointStats stats;
@@ -675,7 +688,7 @@ public abstract class Node<OPERATOR extends Operator> implements Component<Opera
     @Override
     public Stats.CheckpointStats call() throws Exception
     {
-      agent.copyToHDFS(id, windowId);
+      agent.flush(id, windowId);
       stats.checkpointTime = System.currentTimeMillis() - stats.checkpointStartTime;
       return stats;
     }

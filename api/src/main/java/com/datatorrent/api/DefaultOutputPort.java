@@ -45,7 +45,7 @@ public class DefaultOutputPort<T> implements Operator.OutputPort<T>
    */
   public DefaultOutputPort()
   {
-    this.sink = Sink.BLACKHOLE;
+    this.sink = ControlTupleEnabledSink.BLACKHOLE;
   }
 
   /**
@@ -55,13 +55,18 @@ public class DefaultOutputPort<T> implements Operator.OutputPort<T>
    */
   public void emit(T tuple)
   {
+    verifyOperatorThread();
+    sink.put(tuple);
+  }
+
+  protected void verifyOperatorThread()
+  {
     // operatorThread could be null if setup() never got called.
     if (operatorThread != null && Thread.currentThread() != operatorThread) {
       // only under certain modes: enforce this
       throw new IllegalStateException("Current thread " + Thread.currentThread().getName() +
-          " is different from the operator thread " + operatorThread.getName());
+        " is different from the operator thread " + operatorThread.getName());
     }
-    sink.put(tuple);
   }
 
   /**
@@ -70,7 +75,7 @@ public class DefaultOutputPort<T> implements Operator.OutputPort<T>
    * Called by execution engine to inject sink at deployment time.
    */
   @Override
-  public final void setSink(Sink<Object> s)
+  public void setSink(Sink<Object> s)
   {
     this.sink = s == null ? Sink.BLACKHOLE : s;
   }
@@ -83,7 +88,7 @@ public class DefaultOutputPort<T> implements Operator.OutputPort<T>
    */
   public boolean isConnected()
   {
-    return sink != Sink.BLACKHOLE;
+    return sink != ControlTupleEnabledSink.BLACKHOLE;
   }
 
   /**
@@ -113,4 +118,8 @@ public class DefaultOutputPort<T> implements Operator.OutputPort<T>
   {
   }
 
+  protected Sink<Object> getSink()
+  {
+    return sink;
+  }
 }

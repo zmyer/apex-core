@@ -932,7 +932,7 @@ public class StreamCodecTest
           PTOperator.PTOutput out = operator.getOutputs().get(0);
           Assert.assertEquals("unifier sinks " + operator.getName(), 1, out.sinks.size());
           PTOperator.PTInput idInput = out.sinks.get(0);
-          LogicalPlan.OperatorMeta idMeta = StreamingContainerAgent.getIdentifyingInputPortMeta(idInput).getOperatorWrapper();
+          LogicalPlan.OperatorMeta idMeta = StreamingContainerAgent.getIdentifyingInputPortMeta(idInput).getOperatorMeta();
           Operator.InputPort<?> idInputPort = null;
           if (idMeta == n2meta) {
             idInputPort = node2.inport1;
@@ -1007,7 +1007,7 @@ public class StreamCodecTest
       lastId = assignNewContainers(dnm, lastId);
 
       List<PTOperator> operators = plan.getOperators(n2meta);
-      List<PTOperator> upstreamOperators = new ArrayList<PTOperator>();
+      List<PTOperator> upstreamOperators = new ArrayList<>();
       for (PTOperator operator : operators) {
         upstreamOperators.addAll(operator.upstreamMerge.values());
         /*
@@ -1036,7 +1036,7 @@ public class StreamCodecTest
       lastId = assignNewContainers(dnm, lastId);
 
       List<PTOperator> operators = plan.getOperators(n3meta);
-      List<PTOperator> upstreamOperators = new ArrayList<PTOperator>();
+      List<PTOperator> upstreamOperators = new ArrayList<>();
       for (PTOperator operator : operators) {
         upstreamOperators.addAll(operator.upstreamMerge.values());
       }
@@ -1063,7 +1063,7 @@ public class StreamCodecTest
       lastId = assignNewContainers(dnm, lastId);
 
       List<PTOperator> operators = plan.getOperators(n2meta);
-      List<PTOperator> upstreamOperators = new ArrayList<PTOperator>();
+      List<PTOperator> upstreamOperators = new ArrayList<>();
       for (PTOperator operator : operators) {
         upstreamOperators.addAll(operator.upstreamMerge.values());
         /*
@@ -1144,7 +1144,7 @@ public class StreamCodecTest
 
   private Set<PTOperator> getUnifiers(PhysicalPlan plan)
   {
-    Set<PTOperator> unifiers = new HashSet<PTOperator>();
+    Set<PTOperator> unifiers = new HashSet<>();
     for (PTContainer container : plan.getContainers()) {
       for (PTOperator operator : container.getOperators()) {
         if (operator.isUnifier()) {
@@ -1159,10 +1159,10 @@ public class StreamCodecTest
       Map<Integer, StreamCodec<?>> streamCodecs,
       String id, PhysicalPlan plan)
   {
-    StreamCodec<?> streamCodecInfo = StreamingContainerAgent.getStreamCodec(operatorMeta.getMeta(inputPort));
-    Assert.assertTrue("stream codec identifier not present" + id, isStrCodecPresent(streamCodecInfo, plan));
-    Integer streamCodecIdentifier = plan.getStreamCodecIdentifier(streamCodecInfo);
-    checkPresentStreamCodecInfo(streamCodecs, id, streamCodecIdentifier, streamCodecInfo);
+    StreamCodec<?> streamCodec = operatorMeta.getMeta(inputPort).getStreamCodec();
+    Assert.assertTrue("stream codec identifier not present" + id, isStrCodecPresent(streamCodec, plan));
+    Integer streamCodecIdentifier = plan.getStreamCodecIdentifier(streamCodec);
+    checkPresentStreamCodecInfo(streamCodecs, id, streamCodecIdentifier, streamCodec);
   }
 
   private void checkPresentStreamCodecInfo(Map<Integer, StreamCodec<?>> streamCodecs, String id,

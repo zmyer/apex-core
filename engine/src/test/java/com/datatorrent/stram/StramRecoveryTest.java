@@ -40,9 +40,11 @@ import org.junit.Rule;
 import org.junit.Test;
 import org.mockito.Mockito;
 import org.mockito.invocation.InvocationOnMock;
+import org.mockito.stubbing.Answer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.apex.engine.util.CascadeStorageAgent;
 import org.apache.commons.lang.mutable.MutableBoolean;
 import org.apache.commons.lang.mutable.MutableInt;
 import org.apache.hadoop.conf.Configuration;
@@ -240,7 +242,7 @@ public class StramRecoveryTest
     csr.setSinkOperatorPortName("inport1");
     FutureTask<?> lpmf = scm.logicalPlanModification(Lists.newArrayList(cor, csr));
     while (!lpmf.isDone()) {
-      scm.monitorHeartbeat();
+      scm.monitorHeartbeat(false);
     }
     Assert.assertNull(lpmf.get()); // unmask exception, if any
 
@@ -427,6 +429,7 @@ public class StramRecoveryTest
     o1p1.getContainer().setExternalId("cid1");
     scm.writeJournal(o1p1.getContainer().getSetContainerState());
 
+    /* simulate application restart from app1 */
     dag = new LogicalPlan();
     dag.setAttribute(LogicalPlan.APPLICATION_PATH, appPath2);
     dag.setAttribute(LogicalPlan.APPLICATION_ID, appId2);
@@ -446,9 +449,50 @@ public class StramRecoveryTest
     o1p1 = plan.getOperators(dag.getOperatorMeta("o1")).get(0);
     assertEquals("journal copied", "cid1", o1p1.getContainer().getExternalId());
 
-    ids = new FSStorageAgent(appPath2 + "/" + LogicalPlan.SUBDIR_CHECKPOINTS, new Configuration()).getWindowIds(o1p1.getId());
+    CascadeStorageAgent csa = (CascadeStorageAgent)dag.getAttributes().get(OperatorContext.STORAGE_AGENT);
+    Assert.assertEquals("storage agent is replaced by cascade", csa.getClass(), CascadeStorageAgent.class);
+    Assert.assertEquals("current storage agent is of same type", csa.getCurrentStorageAgent().getClass(), agent.getClass());
+    Assert.assertEquals("parent storage agent is of same type ", csa.getParentStorageAgent().getClass(), agent.getClass());
+    /* parent and current points to expected location */
+    Assert.assertEquals(true, ((FSStorageAgent)csa.getParentStorageAgent()).path.contains("app1"));
+    Assert.assertEquals(true, ((FSStorageAgent)csa.getCurrentStorageAgent()).path.contains("app2"));
+
+    ids = csa.getWindowIds(o1p1.getId());
     Assert.assertArrayEquals("checkpoints copied", new long[] {o1p1.getRecoveryCheckpoint().getWindowId()}, ids);
 
+
+    /* simulate another application restart from app2 */
+    String appId3 = "app3";
+    String appPath3 = testMeta.getPath() + "/" + appId3;
+    dag = new LogicalPlan();
+    dag.setAttribute(LogicalPlan.APPLICATION_PATH, appPath3);
+    dag.setAttribute(LogicalPlan.APPLICATION_ID, appId3);
+    sc = new StramClient(new Configuration(), dag);
+    try {
+      sc.start();
+      sc.copyInitialState(new Path(appPath2)); // copy state from app2.
+    } finally {
+      sc.stop();
+    }
+    scm = StreamingContainerManager.getInstance(new FSRecoveryHandler(dag.assertAppPath(), new Configuration(false)), dag, false);
+    plan = scm.getPhysicalPlan();
+    dag = plan.getLogicalPlan();
+
+    csa = (CascadeStorageAgent)dag.getAttributes().get(OperatorContext.STORAGE_AGENT);
+    Assert.assertEquals("storage agent is replaced by cascade", csa.getClass(), CascadeStorageAgent.class);
+    Assert.assertEquals("current storage agent is of same type", csa.getCurrentStorageAgent().getClass(), agent.getClass());
+    Assert.assertEquals("parent storage agent is of same type ", csa.getParentStorageAgent().getClass(), CascadeStorageAgent.class);
+
+    CascadeStorageAgent parent = (CascadeStorageAgent)csa.getParentStorageAgent();
+    Assert.assertEquals("current storage agent is of same type ", parent.getCurrentStorageAgent().getClass(), agent.getClass());
+    Assert.assertEquals("parent storage agent is cascade ", parent.getParentStorageAgent().getClass(), agent.getClass());
+    /* verify paths */
+    Assert.assertEquals(true, ((FSStorageAgent)parent.getParentStorageAgent()).path.contains("app1"));
+    Assert.assertEquals(true, ((FSStorageAgent)parent.getCurrentStorageAgent()).path.contains("app2"));
+    Assert.assertEquals(true, ((FSStorageAgent)csa.getCurrentStorageAgent()).path.contains("app3"));
+
+    ids = csa.getWindowIds(o1p1.getId());
+    Assert.assertArrayEquals("checkpoints copied", new long[] {o1p1.getRecoveryCheckpoint().getWindowId()}, ids);
   }
 
   @Test
@@ -474,7 +518,7 @@ public class StramRecoveryTest
 
     StreamingContainerUmbilicalProtocol impl = Mockito.mock(StreamingContainerUmbilicalProtocol.class, Mockito.withSettings().extraInterfaces(Closeable.class));
 
-    Mockito.doAnswer(new org.mockito.stubbing.Answer<Void>()
+    final Answer<Void> answer = new Answer<Void>()
     {
       @Override
       public Void answer(InvocationOnMock invocation)
@@ -491,8 +535,9 @@ public class StramRecoveryTest
         }
         return null;
       }
-    })
-    .when(impl).log("containerId", "timeout");
+    };
+    Mockito.doAnswer(answer).when(impl).log("containerId", "timeout");
+    Mockito.doAnswer(answer).when(impl).reportError("containerId", null, "timeout", null);
 
     Server server = new RPC.Builder(conf).setProtocol(StreamingContainerUmbilicalProtocol.class).setInstance(impl)
         .setBindAddress("0.0.0.0").setPort(0).setNumHandlers(1).setVerbose(false).build();
@@ -546,7 +591,7 @@ public class StramRecoveryTest
 
     rp = new RecoverableRpcProxy(appPath, conf);
     protocolProxy = rp.getProxy();
-    protocolProxy.log("containerId", "msg");
+    protocolProxy.reportError("containerId", null, "msg", null);
     try {
       protocolProxy.log("containerId", "timeout");
       Assert.fail("expected socket timeout");
@@ -562,7 +607,7 @@ public class StramRecoveryTest
     uri = RecoverableRpcProxy.toConnectURI(address);
     recoveryHandler.writeConnectUri(uri.toString());
 
-    protocolProxy.log("containerId", "timeout");
+    protocolProxy.reportError("containerId", null, "timeout", null);
     Assert.assertTrue("timedout", timedout.get());
 
     restoreSystemProperty(RecoverableRpcProxy.RPC_TIMEOUT, rpcTimeout);

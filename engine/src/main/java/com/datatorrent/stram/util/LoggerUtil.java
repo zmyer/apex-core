@@ -18,27 +18,49 @@
  */
 package com.datatorrent.stram.util;
 
+import java.io.File;
+import java.io.IOException;
+import java.io.StringReader;
+import java.lang.reflect.Method;
 import java.util.Enumeration;
 import java.util.Iterator;
+import java.util.LinkedList;
+import java.util.List;
 import java.util.Map;
+import java.util.Properties;
 import java.util.regex.Pattern;
 
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
+import org.apache.apex.log.LogFileInformation;
+
+import org.apache.hadoop.yarn.api.ApplicationConstants.Environment;
+import org.apache.hadoop.yarn.api.records.ApplicationId;
+import org.apache.hadoop.yarn.api.records.ContainerId;
+import org.apache.hadoop.yarn.util.ConverterUtils;
 import org.apache.log4j.Appender;
 import org.apache.log4j.Category;
+import org.apache.log4j.FileAppender;
 import org.apache.log4j.Level;
 import org.apache.log4j.LogManager;
 import org.apache.log4j.Logger;
+import org.apache.log4j.MDC;
+import org.apache.log4j.PropertyConfigurator;
 import org.apache.log4j.spi.DefaultRepositorySelector;
 import org.apache.log4j.spi.HierarchyEventListener;
 import org.apache.log4j.spi.LoggerFactory;
 import org.apache.log4j.spi.LoggerRepository;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Function;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Maps;
+
+import com.datatorrent.stram.client.StramClientUtils;
+
+import static com.datatorrent.api.Context.DAGContext.APPLICATION_NAME;
+import static com.datatorrent.api.Context.DAGContext.LOGGER_APPENDER;
 
 /**
  * @since 3.5.0
@@ -184,6 +206,12 @@ public class LoggerUtil
 
   static {
     logger.debug("initializing LoggerUtil");
+    initializeLogger();
+  }
+
+  @VisibleForTesting
+  static void initializeLogger()
+  {
     LogManager.setRepositorySelector(new DefaultRepositorySelector(new DelegatingLoggerRepository(LogManager.getLoggerRepository())), null);
   }
 
@@ -277,5 +305,267 @@ public class LoggerUtil
       }
     }
     return ImmutableMap.copyOf(matchedClasses);
+  }
+
+  /**
+   * Returns logger log file {@link LogFileInformation}
+   * @return logFileInformation
+   */
+  public static LogFileInformation getLogFileInformation()
+  {
+    return getLogFileInformation(LogManager.getRootLogger());
+  }
+
+  public static LogFileInformation getLogFileInformation(org.slf4j.Logger logger)
+  {
+    return getLogFileInformation(logger == null ? null : LogManager.getLogger(logger.getName()));
+  }
+
+  public static LogFileInformation getLogFileInformation(Logger logger)
+  {
+    if (logger == null) {
+      logger = LogManager.getRootLogger();
+    }
+    FileAppender fileAppender = getFileAppender(logger);
+    if (fileAppender != null) {
+      File logFile = new File(fileAppender.getFile());
+      LogFileInformation logFileInfo = new LogFileInformation(fileAppender.getFile(), logFile.length());
+      return logFileInfo;
+    }
+    return null;
+  }
+
+  private static FileAppender getFileAppender(Logger logger)
+  {
+    Enumeration e = logger.getAllAppenders();
+    FileAppender fileAppender = null;
+    while (e.hasMoreElements()) {
+      Object appender = e.nextElement();
+      if (appender instanceof FileAppender) {
+        if (fileAppender == null) {
+          fileAppender = (FileAppender)appender;
+        } else {
+          //skip fetching log file information if we have multiple file Appenders
+          fileAppender = null;
+          break;
+        }
+      }
+    }
+    /*
+     * We should return log file information only if,
+     * we have single file Appender, the logging level of appender is set to level Error or above and immediateFlush is set to true.
+     * In future we should be able to enhance this feature to support multiple file appenders.
+     */
+    if (fileAppender == null || !fileAppender.getImmediateFlush() || !fileAppender.isAsSevereAsThreshold(Level.ERROR)) {
+      LoggerUtil.logger.warn(
+          "Log information is unavailable. To enable log information log4j/logging should be configured with single FileAppender that has immediateFlush set to true and log level set to ERROR or greater.");
+      return null;
+    }
+    return fileAppender;
+  }
+
+  private static boolean isErrorLevelEnable(FileAppender fileAppender)
+  {
+    if (fileAppender != null) {
+      Level p = (Level)fileAppender.getThreshold();
+      if (p == null) {
+        p = LogManager.getRootLogger().getLevel();
+      }
+      if (p != null) {
+        return Level.ERROR.isGreaterOrEqual(p);
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Adds Logger Appender
+   * @param name Appender name
+   * @param properties Appender properties
+   * @return True if the appender has been added successfully
+   */
+  public static boolean addAppender(String name, Properties properties)
+  {
+    return addAppender(LogManager.getRootLogger(), name, properties);
+  }
+
+  /**
+   * Adds Logger Appender to a specified logger
+   * @param logger Logger to add appender to, if null, use root logger
+   * @param name Appender name
+   * @param properties Appender properties
+   * @return True if the appender has been added successfully
+   */
+  public static boolean addAppender(Logger logger, String name, Properties properties)
+  {
+    if (logger == null) {
+      logger = LogManager.getRootLogger();
+    }
+    if (getAppendersNames(logger).contains(name)) {
+      LoggerUtil.logger.warn("A logger appender with the name '{}' exists. Cannot add a new logger appender with the same name", name);
+    } else {
+      try {
+        Method method = PropertyConfigurator.class.getDeclaredMethod("parseAppender", Properties.class, String.class);
+        method.setAccessible(true);
+        Appender appender = (Appender)method.invoke(new PropertyConfigurator(), properties, name);
+        if (appender == null) {
+          LoggerUtil.logger.warn("Cannot add a new logger appender. Name: {}, Properties: {}", name, properties);
+        } else {
+          logger.addAppender(appender);
+          return true;
+        }
+      } catch (Exception ex) {
+        LoggerUtil.logger.warn("Cannot add a new logger appender. Name: {}, Properties: {}", name, properties, ex);
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Adds Logger Appenders
+   * @param names Names of appender
+   * @param args Args with properties
+   * @param propertySeparator Property separator
+   * @return True if all of the appenders have been added successfully
+   */
+  public static boolean addAppenders(String[] names, String args, String propertySeparator)
+  {
+    return addAppenders(LogManager.getRootLogger(), names, args, propertySeparator);
+  }
+
+  /**
+   * Adds Logger Appenders
+   * @param logger Logger to add appender to, if null, use root logger
+   * @param names Names of appender
+   * @param args Args with properties
+   * @param propertySeparator Property separator
+   * @return True if all of the appenders have been added successfully
+   */
+  public static boolean addAppenders(Logger logger, String[] names, String args, String propertySeparator)
+  {
+    if (names == null || args == null || names.length == 0 || propertySeparator == null) {
+      throw new IllegalArgumentException("Incorrect appender parametrs");
+    }
+    boolean status = true;
+    try {
+      Properties properties = new Properties();
+      properties.load(new StringReader(args.replaceAll(propertySeparator, "\n")));
+      if (logger == null) {
+        logger = LogManager.getRootLogger();
+      }
+      for (String name : names) {
+        if (!addAppender(logger, name, properties)) {
+          status = false;
+        }
+      }
+    } catch (IOException ex) {
+      ;
+    }
+    return status;
+  }
+
+  /**
+   * Adds Default Logger Appenders
+   * Syntax of a value of the default appender parameters: {appender-names};{string-with-properties}
+   * Comma is a separator between appender names and properties
+   * @return True if all of the appenders have been added successfully
+   */
+  public static boolean addAppenders()
+  {
+    String appenderParameters = System.getProperty(LOGGER_APPENDER.getLongName());
+    if (appenderParameters != null) {
+      String[] splits = appenderParameters.split(";", 2);
+      if (splits.length != 2) {
+        return false;
+      }
+      return addAppenders(splits[0].split(","), splits[1], ",");
+    }
+    return false;
+  }
+
+  /**
+   * Removes Logger Appender
+   * @param name Appender name
+   * @return True if the appender has been removed successfully
+   */
+  public static boolean removeAppender(String name)
+  {
+    return removeAppender(LogManager.getRootLogger(), name);
+  }
+
+  /**
+   * Removes Logger Appender
+   * @param logger Logger to remove appender from, if null, use root logger
+   * @param name Appender name
+   * @return True if the appender has been removed successfully
+   */
+  public static boolean removeAppender(Logger logger, String name)
+  {
+    if (logger == null) {
+      logger = LogManager.getRootLogger();
+    }
+    try {
+      logger.removeAppender(name);
+    } catch (Exception ex) {
+      LoggerUtil.logger.error("Cannot remove the logger appender: {}", name, ex);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Returns a list names of the appenders
+   * @return Names of the appenders
+   */
+  public static List<String> getAppendersNames()
+  {
+    return getAppendersNames(LogManager.getRootLogger());
+  }
+
+  /**
+   * Returns a list names of the appenders
+   * @param logger Logger to list appender for, if null, use root logger
+   * @return Names of the appenders
+   */
+  public static List<String> getAppendersNames(Logger logger)
+  {
+    if (logger == null) {
+      logger = LogManager.getRootLogger();
+    }
+    Enumeration enumeration = logger.getAllAppenders();
+    List<String> names = new LinkedList<>();
+    while (enumeration.hasMoreElements()) {
+      names.add(((Appender)enumeration.nextElement()).getName());
+    }
+    return names;
+  }
+
+  /**
+   * Makes MDC properties
+   */
+  public static void setupMDC(String service)
+  {
+    MDC.put("apex.service", service);
+
+    String value = StramClientUtils.getHostName();
+    MDC.put("apex.node", value == null ? "unknown" : value);
+
+    value = System.getenv(Environment.USER.key());
+    if (value != null) {
+      MDC.put("apex.user", value);
+    }
+
+    value = System.getenv(Environment.CONTAINER_ID.name());
+    if (value != null) {
+      ContainerId containerId = ConverterUtils.toContainerId(value);
+      ApplicationId applicationId = containerId.getApplicationAttemptId().getApplicationId();
+      MDC.put("apex.containerId", containerId.toString());
+      MDC.put("apex.applicationId", applicationId.toString());
+    }
+
+    value = System.getProperty(APPLICATION_NAME.getLongName());
+    if (value != null) {
+      MDC.put("apex.application", value);
+    }
   }
 }

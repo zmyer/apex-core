@@ -27,6 +27,18 @@ import com.datatorrent.common.util.BaseOperator;
 
 public class StdoutOperator extends BaseOperator
 {
+  private String testInput;
+
+  public String getTestInput()
+  {
+    return testInput;
+  }
+
+  public void setTestInput(String testInput)
+  {
+    this.testInput = testInput;
+  }
+
   public final transient DefaultInputPort<Object> in = new DefaultInputPort<Object>()
   {
     @Override

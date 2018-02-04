@@ -124,14 +124,14 @@ public class StreamingContainerManagerTest
     input.portName = "inputPortNameOnNode";
     input.sourceNodeId = 99;
 
-    ndi.inputs = new ArrayList<OperatorDeployInfo.InputDeployInfo>();
+    ndi.inputs = new ArrayList<>();
     ndi.inputs.add(input);
 
     OperatorDeployInfo.OutputDeployInfo output = new OperatorDeployInfo.OutputDeployInfo();
     output.declaredStreamId = "streamFromNode";
     output.portName = "outputPortNameOnNode";
 
-    ndi.outputs = new ArrayList<OperatorDeployInfo.OutputDeployInfo>();
+    ndi.outputs = new ArrayList<>();
     ndi.outputs.add(output);
 
     ContainerHeartbeatResponse scc = new ContainerHeartbeatResponse();
@@ -369,6 +369,103 @@ public class StreamingContainerManagerTest
     Assert.assertEquals("sourcePortName " + node3DI, mergeNodeDI.outputs.get(0).portName, node3In.sourcePortName);
   }
 
+  private static void shutdownOperator(StreamingContainerManager scm, PTOperator p1, PTOperator p2)
+  {
+    assignContainer(scm, "c1");
+    assignContainer(scm, "c2");
+
+    ContainerHeartbeat c1hb = new ContainerHeartbeat();
+    c1hb.setContainerStats(new ContainerStats(p1.getContainer().getExternalId()));
+    scm.processHeartbeat(c1hb);
+
+    ContainerHeartbeat c2hb = new ContainerHeartbeat();
+    c2hb.setContainerStats(new ContainerStats(p2.getContainer().getExternalId()));
+    scm.processHeartbeat(c2hb);
+
+    OperatorHeartbeat o1hb = new OperatorHeartbeat();
+    c1hb.getContainerStats().addNodeStats(o1hb);
+    o1hb.setNodeId(p1.getId());
+    o1hb.setState(DeployState.ACTIVE);
+    OperatorStats o1stats = new OperatorStats();
+    o1hb.getOperatorStatsContainer().add(o1stats);
+    o1stats.checkpoint = new Checkpoint(2, 0, 0);
+    o1stats.windowId = 3;
+    scm.processHeartbeat(c1hb);
+    Assert.assertEquals(PTOperator.State.ACTIVE, p1.getState());
+
+    OperatorHeartbeat o2hb = new OperatorHeartbeat();
+    c2hb.getContainerStats().addNodeStats(o2hb);
+    o2hb.setNodeId(p2.getId());
+    o2hb.setState(DeployState.ACTIVE);
+    OperatorStats o2stats = new OperatorStats();
+    o2stats.checkpoint = new Checkpoint(2, 0, 0);
+    o2stats.windowId = 3;
+    scm.processHeartbeat(c2hb);
+    Assert.assertEquals(PTOperator.State.ACTIVE, p1.getState());
+    Assert.assertEquals(PTOperator.State.ACTIVE, p2.getState());
+
+    o1hb.setState(DeployState.SHUTDOWN);
+    o1stats.checkpoint = new Checkpoint(4, 0,0);
+    o1stats.windowId = 5;
+    scm.processHeartbeat(c1hb);
+    Assert.assertEquals(PTOperator.State.INACTIVE, p1.getState());
+  }
+
+  @Test
+  public void testShutdownOperatorTimeout() throws Exception
+  {
+    GenericTestOperator o1 = dag.addOperator("o1", GenericTestOperator.class);
+    GenericTestOperator o2 = dag.addOperator("o2", GenericTestOperator.class);
+
+    dag.addStream("s1", o1.outport1, o2.inport1);
+
+    dag.setAttribute(OperatorContext.STORAGE_AGENT, new MemoryStorageAgent());
+    dag.setAttribute(Context.DAGContext.STREAMING_WINDOW_SIZE_MILLIS, 50);
+    dag.setAttribute(OperatorContext.TIMEOUT_WINDOW_COUNT, 1);
+
+    StreamingContainerManager scm = new StreamingContainerManager(dag);
+
+    PhysicalPlan plan = scm.getPhysicalPlan();
+
+    PTOperator p1 = plan.getOperators(dag.getMeta(o1)).get(0);
+    PTOperator p2 = plan.getOperators(dag.getMeta(o2)).get(0);
+
+    shutdownOperator(scm, p1, p2);
+
+    scm.monitorHeartbeat(false);
+    Assert.assertTrue(scm.containerStopRequests.isEmpty());
+    Thread.sleep(100);
+    scm.monitorHeartbeat(false);
+    Assert.assertFalse(scm.containerStopRequests.containsKey(p1.getContainer().getExternalId()));
+    Assert.assertTrue(scm.containerStopRequests.containsKey(p2.getContainer().getExternalId()));
+  }
+
+  @Test
+  public void testShutdownOperatorRecovery() throws Exception
+  {
+    GenericTestOperator o1 = dag.addOperator("o1", GenericTestOperator.class);
+    GenericTestOperator o2 = dag.addOperator("o2", GenericTestOperator.class);
+
+    dag.addStream("s1", o1.outport1, o2.inport1);
+
+    dag.setAttribute(OperatorContext.STORAGE_AGENT, new MemoryStorageAgent());
+
+    StreamingContainerManager scm = new StreamingContainerManager(dag);
+    scm.containerStartRequests.poll();
+    scm.containerStartRequests.poll();
+
+    PhysicalPlan plan = scm.getPhysicalPlan();
+
+    PTOperator p1 = plan.getOperators(dag.getMeta(o1)).get(0);
+    PTOperator p2 = plan.getOperators(dag.getMeta(o2)).get(0);
+
+    shutdownOperator(scm, p1, p2);
+
+    scm.scheduleContainerRestart(p1.getContainer().getExternalId());
+    ContainerStartRequest dr = scm.containerStartRequests.poll();
+    Assert.assertTrue(dr.container.getOperators().contains(p1));
+  }
+
   @Test
   public void testRecoveryOrder() throws Exception
   {
@@ -468,16 +565,6 @@ public class StreamingContainerManagerTest
     long[] windowsIds = sa.getWindowIds(1);
     Arrays.sort(windowsIds);
     Assert.assertArrayEquals("Saved windowIds", windowIds, windowsIds);
-
-    for (long windowId : windowIds) {
-      sa.delete(1, windowId);
-    }
-    try {
-      sa.getWindowIds(1);
-      Assert.fail("There should not be any most recently saved windowId!");
-    } catch (IOException io) {
-      Assert.assertTrue("No State Saved", true);
-    }
   }
 
   @Test
@@ -495,16 +582,6 @@ public class StreamingContainerManagerTest
     long[] windowsIds = sa.getWindowIds(1);
     Arrays.sort(windowsIds);
     Assert.assertArrayEquals("Saved windowIds", windowIds, windowsIds);
-
-    for (long windowId : windowIds) {
-      sa.delete(1, windowId);
-    }
-    try {
-      sa.getWindowIds(1);
-      Assert.fail("There should not be any most recently saved windowId!");
-    } catch (IOException io) {
-      Assert.assertTrue("No State Saved", true);
-    }
   }
 
   @Test
@@ -737,7 +814,9 @@ public class StreamingContainerManagerTest
       ce.getKey().bufferServerAddress = null;
     }
 
-    PTOperator o1p1 = physicalPlan.getOperators(dag.getMeta(o1)).get(0);
+    List<PTOperator> o1p = physicalPlan.getOperators(dag.getMeta(o1));
+    Assert.assertEquals("o1 partitions", 1,  o1p.size());
+    PTOperator o1p1 = o1p.get(0);
     MockContainer mc1 = mockContainers.get(o1p1.getContainer());
     MockOperatorStats o1p1mos = mc1.stats(o1p1.getId());
     o1p1mos.currentWindowId(1).checkpointWindowId(1).deployState(DeployState.ACTIVE);
@@ -749,7 +828,7 @@ public class StreamingContainerManagerTest
     o2p1mos.currentWindowId(1).checkpointWindowId(1).deployState(DeployState.ACTIVE);
     mc2.sendHeartbeat();
 
-    Assert.assertEquals("2 partitions", 2, physicalPlan.getOperators(dag.getMeta(o2)).size());
+    Assert.assertEquals("o2 partitions", 2, physicalPlan.getOperators(dag.getMeta(o2)).size());
 
     PTOperator o2p2 = physicalPlan.getOperators(dag.getMeta(o2)).get(1);
     MockContainer mc3 = mockContainers.get(o2p2.getContainer());
@@ -757,6 +836,7 @@ public class StreamingContainerManagerTest
     o2p2mos.currentWindowId(1).checkpointWindowId(1).deployState(DeployState.ACTIVE);
     mc3.sendHeartbeat();
 
+    Assert.assertEquals("o3 partitions", 1, physicalPlan.getOperators(dag.getMeta(o3)).size());
     PTOperator o3p1 = physicalPlan.getOperators(dag.getMeta(o3)).get(0);
     MockContainer mc4 = mockContainers.get(o3p1.getContainer());
     MockOperatorStats o3p1mos = mc4.stats(o3p1.getId());
@@ -769,9 +849,13 @@ public class StreamingContainerManagerTest
 
     o1p1mos.currentWindowId(2).deployState(DeployState.SHUTDOWN);
     mc1.sendHeartbeat();
-    scm.monitorHeartbeat();
+    o1p = physicalPlan.getOperators(dag.getMeta(o1));
+    Assert.assertEquals("o1 partitions", 1,  o1p.size());
+    Assert.assertEquals("o1p1 present", o1p1, o1p.get(0));
+    Assert.assertEquals("input operator state", PTOperator.State.INACTIVE, o1p1.getState());
+    scm.monitorHeartbeat(false);
     Assert.assertEquals("committedWindowId", -1, scm.getCommittedWindowId());
-    scm.monitorHeartbeat(); // committedWindowId updated in next cycle
+    scm.monitorHeartbeat(false); // committedWindowId updated in next cycle
     Assert.assertEquals("committedWindowId", 1, scm.getCommittedWindowId());
     scm.processEvents();
     Assert.assertEquals("containers at committedWindowId=1", 4, physicalPlan.getContainers().size());
@@ -779,7 +863,7 @@ public class StreamingContainerManagerTest
     // checkpoint window 2
     o1p1mos.checkpointWindowId(2);
     mc1.sendHeartbeat();
-    scm.monitorHeartbeat();
+    scm.monitorHeartbeat(false);
 
     Assert.assertEquals("committedWindowId", 1, scm.getCommittedWindowId());
 
@@ -791,7 +875,7 @@ public class StreamingContainerManagerTest
     mc2.sendHeartbeat();
     mc3.sendHeartbeat();
     mc4.sendHeartbeat();
-    scm.monitorHeartbeat();
+    scm.monitorHeartbeat(false);
 
     // Operators are shutdown when both operators reach window Id 2
     Assert.assertEquals(0, o1p1.getContainer().getOperators().size());
@@ -875,7 +959,6 @@ public class StreamingContainerManagerTest
   private void testAppDataSources(boolean appendQIDToTopic) throws Exception
   {
     StramLocalCluster lc = new StramLocalCluster(dag);
-    lc.runAsync();
     StreamingContainerManager dnmgr = lc.dnmgr;
     List<AppDataSource> appDataSources = dnmgr.getAppDataSources();
     Assert.assertEquals("There should be exactly one data source", 1, appDataSources.size());
@@ -890,7 +973,6 @@ public class StreamingContainerManagerTest
     Assert.assertEquals("Result topic verification", "xyz.result", result.topic);
     Assert.assertEquals("Result URL verification", "ws://123.123.123.124:9090/pubsub", result.url);
     Assert.assertEquals("Result QID append verification", appendQIDToTopic, result.appendQIDToTopic);
-    lc.shutdown();
   }
 
   @Test

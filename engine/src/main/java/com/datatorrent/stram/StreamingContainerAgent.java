@@ -51,6 +51,7 @@ import com.datatorrent.stram.api.OperatorDeployInfo.InputDeployInfo;
 import com.datatorrent.stram.api.OperatorDeployInfo.OperatorType;
 import com.datatorrent.stram.api.OperatorDeployInfo.OutputDeployInfo;
 import com.datatorrent.stram.api.OperatorDeployInfo.UnifierDeployInfo;
+import com.datatorrent.stram.api.StreamingContainerUmbilicalProtocol.ShutdownType;
 import com.datatorrent.stram.api.StreamingContainerUmbilicalProtocol.StramToNodeRequest;
 import com.datatorrent.stram.api.StreamingContainerUmbilicalProtocol.StreamingContainerContext;
 import com.datatorrent.stram.engine.OperatorContext;
@@ -96,7 +97,7 @@ public class StreamingContainerAgent
     this.dnmgr = dnmgr;
   }
 
-  boolean shutdownRequested = false;
+  ShutdownType shutdownRequest = null;
   boolean stackTraceRequested = false;
 
   Set<PTOperator> deployOpers = Sets.newHashSet();
@@ -201,7 +202,11 @@ public class StreamingContainerAgent
         if (ndi.type == OperatorDeployInfo.OperatorType.UNIFIER) {
           // input attributes of the downstream operator
           for (InputPortMeta sink : streamMeta.getSinks()) {
-            portInfo.contextAttributes = sink.getAttributes();
+            try {
+              portInfo.contextAttributes = sink.getAttributes().clone();
+            } catch (CloneNotSupportedException e) {
+              throw new RuntimeException("Cannot clone attributes", e);
+            }
             break;
           }
         }
@@ -214,11 +219,11 @@ public class StreamingContainerAgent
           for (PTOperator.PTInput input : out.sinks) {
             // Create mappings for all non-inline operators
             if (input.target.getContainer() != out.source.getContainer()) {
-              InputPortMeta inputPortMeta = getIdentifyingInputPortMeta(input);
-              StreamCodec<?> streamCodecInfo = getStreamCodec(inputPortMeta);
-              Integer id = physicalPlan.getStreamCodecIdentifier(streamCodecInfo);
+              final StreamCodec<?> streamCodec = getIdentifyingInputPortMeta(input).getStreamCodec();
+              final Integer id = physicalPlan.getStreamCodecIdentifier(streamCodec);
+              // TODO: replace with inputInfo.streamCodecs.putIfAbsent() after support for JDK 1.7 is dropped.
               if (!portInfo.streamCodecs.containsKey(id)) {
-                portInfo.streamCodecs.put(id, streamCodecInfo);
+                portInfo.streamCodecs.put(id, streamCodec);
               }
             }
           }
@@ -247,11 +252,19 @@ public class StreamingContainerAgent
         InputPortMeta inputPortMeta = getInputPortMeta(oper.getOperatorMeta(), streamMeta);
 
         if (inputPortMeta != null) {
-          inputInfo.contextAttributes = inputPortMeta.getAttributes();
+          try {
+            inputInfo.contextAttributes = inputPortMeta.getAttributes().clone();
+          } catch (CloneNotSupportedException e) {
+            throw new RuntimeException("Cannot clone attributes", e);
+          }
         }
 
         if (inputInfo.contextAttributes == null && ndi.type == OperatorDeployInfo.OperatorType.UNIFIER) {
-          inputInfo.contextAttributes = in.source.logicalStream.getSource().getAttributes();
+          try {
+            inputInfo.contextAttributes = in.source.logicalStream.getSource().getAttributes().clone();
+          } catch (CloneNotSupportedException e) {
+            throw new RuntimeException("Cannot clone attributes", e);
+          }
         }
 
         inputInfo.sourceNodeId = sourceOutput.source.getId();
@@ -287,10 +300,12 @@ public class StreamingContainerAgent
 
         // On the input side there is a unlikely scenario of partitions even for inline stream that is being
         // handled. Always specifying a stream codec configuration in case that scenario happens.
-        InputPortMeta idInputPortMeta = getIdentifyingInputPortMeta(in);
-        StreamCodec<?> streamCodecInfo = getStreamCodec(idInputPortMeta);
-        Integer id = physicalPlan.getStreamCodecIdentifier(streamCodecInfo);
-        inputInfo.streamCodecs.put(id, streamCodecInfo);
+        final StreamCodec<?> streamCodec = getIdentifyingInputPortMeta(in).getStreamCodec();
+        final Integer id = physicalPlan.getStreamCodecIdentifier(streamCodec);
+        // TODO: replace with inputInfo.streamCodecs.putIfAbsent() after support for JDK 1.7 is dropped.
+        if (!inputInfo.streamCodecs.containsKey(id)) {
+          inputInfo.streamCodecs.put(id, streamCodec);
+        }
         ndi.inputs.add(inputInfo);
       }
     }
@@ -341,23 +356,6 @@ public class StreamingContainerAgent
       operator = idOperator;
     }
     return operator;
-  }
-
-  public static StreamCodec<?> getStreamCodec(InputPortMeta inputPortMeta)
-  {
-    if (inputPortMeta != null) {
-      StreamCodec<?> codec = inputPortMeta.getValue(PortContext.STREAM_CODEC);
-      if (codec == null) {
-        // it cannot be this object that gets returned. Depending on this value is dangerous
-        codec = inputPortMeta.getPortObject().getStreamCodec();
-        if (codec != null) {
-          // don't create codec multiple times - it will assign a new identifier
-          inputPortMeta.getAttributes().put(PortContext.STREAM_CODEC, codec);
-        }
-      }
-      return codec;
-    }
-    return null;
   }
 
   /**
@@ -484,4 +482,14 @@ public class StreamingContainerAgent
   }
 
   public volatile String containerStackTrace = null;
+
+  public void requestShutDown(ShutdownType type)
+  {
+    shutdownRequest = type;
+  }
+
+  public boolean isShutdownRequested()
+  {
+    return (shutdownRequest != null);
+  }
 }

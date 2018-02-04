@@ -32,6 +32,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.apex.common.util.ToStringStyle;
+import org.apache.commons.lang.builder.ToStringBuilder;
+
 import com.datatorrent.bufferserver.packet.BeginWindowTuple;
 import com.datatorrent.bufferserver.packet.MessageType;
 import com.datatorrent.bufferserver.packet.ResetWindowTuple;
@@ -55,6 +58,8 @@ import static com.google.common.collect.Sets.newHashSet;
  */
 public class DataList
 {
+  private static final Logger logger = LoggerFactory.getLogger(DataList.class);
+
   private final int MAX_COUNT_OF_INMEM_BLOCKS;
   protected final String identifier;
   private final int blockSize;
@@ -71,9 +76,10 @@ public class DataList
   private final Set<AbstractClient> suspendedClients = newHashSet();
   private final AtomicInteger numberOfInMemBlockPermits;
   private MutableInt nextOffset = new MutableInt();
-  private Future<?> future;
+  private final ListenersNotifier listenersNotifier = new ListenersNotifier();
+  private final boolean backPressureEnabled;
 
-  public DataList(final String identifier, final int blockSize, final int numberOfCacheBlocks)
+  public DataList(final String identifier, final int blockSize, final int numberOfCacheBlocks, final boolean backPressureEnabled)
   {
     if (numberOfCacheBlocks < 1) {
       throw new IllegalArgumentException("Invalid number of Data List Memory blocks " + numberOfCacheBlocks);
@@ -82,6 +88,7 @@ public class DataList
     numberOfInMemBlockPermits = new AtomicInteger(MAX_COUNT_OF_INMEM_BLOCKS - 1);
     this.identifier = identifier;
     this.blockSize = blockSize;
+    this.backPressureEnabled = backPressureEnabled;
     first = last = new Block(identifier, blockSize);
   }
 
@@ -91,7 +98,7 @@ public class DataList
      * We use 64MB (the default HDFS block getSize) as the getSize of the memory pool so we can flush the data 1 block
      * at a time to the filesystem. We will use default value of 8 block sizes to be cached in memory
      */
-    this(identifier, 64 * 1024 * 1024, 8);
+    this(identifier, 64 * 1024 * 1024, 8, true);
   }
 
   public int getBlockSize()
@@ -172,6 +179,7 @@ public class DataList
         }
       }
       first = last;
+      first.prev = null;
     }
     numberOfInMemBlockPermits.set(MAX_COUNT_OF_INMEM_BLOCKS - 1);
   }
@@ -188,6 +196,7 @@ public class DataList
         if (temp.ending_window > windowId || temp == last) {
           if (prev != null) {
             first = temp;
+            first.prev = null;
           }
           first.purge(windowId);
           break;
@@ -287,22 +296,12 @@ public class DataList
 
   public void notifyListeners()
   {
-    if (future == null || future.isDone() || future.isCancelled()) {
-      future = autoFlushExecutor.submit(new Runnable()
-      {
-        @Override
-        public void run()
-        {
-          boolean atLeastOneListenerHasDataToSend = false;
-          for (DataListener dl : all_listeners) {
-            atLeastOneListenerHasDataToSend |= dl.addedData();
-          }
-          if (atLeastOneListenerHasDataToSend) {
-            future = autoFlushExecutor.submit(this);
-          }
-        }
-      });
+    try {
+      listenersNotifier.moreDataAvailable();
+    } catch (RuntimeException e) {
+      logger.warn("{}", listenersNotifier, e);
     }
+    logger.debug("{} notified", listenersNotifier);
   }
 
   public void setAutoFlushExecutor(final ExecutorService es)
@@ -347,14 +346,14 @@ public class DataList
   {
     all_listeners.add(dl);
     //logger.debug("total {} listeners {} -> {}", all_listeners.size(), dl, this);
-    ArrayList<BitVector> partitions = new ArrayList<BitVector>();
+    ArrayList<BitVector> partitions = new ArrayList<>();
     if (dl.getPartitions(partitions) > 0) {
       for (BitVector partition : partitions) {
         HashSet<DataListener> set;
         if (listeners.containsKey(partition)) {
           set = listeners.get(partition);
         } else {
-          set = new HashSet<DataListener>();
+          set = new HashSet<>();
           listeners.put(partition, set);
         }
         set.add(dl);
@@ -364,17 +363,18 @@ public class DataList
       if (listeners.containsKey(DataListener.NULL_PARTITION)) {
         set = listeners.get(DataListener.NULL_PARTITION);
       } else {
-        set = new HashSet<DataListener>();
+        set = new HashSet<>();
         listeners.put(DataListener.NULL_PARTITION, set);
       }
 
       set.add(dl);
     }
+    listenersNotifier.run();
   }
 
   public void removeDataListener(DataListener dl)
   {
-    ArrayList<BitVector> partitions = new ArrayList<BitVector>();
+    ArrayList<BitVector> partitions = new ArrayList<>();
     if (dl.getPartitions(partitions) > 0) {
       for (BitVector partition : partitions) {
         if (listeners.containsKey(partition)) {
@@ -401,12 +401,7 @@ public class DataList
   {
     boolean resumedSuspendedClients = false;
     if (numberOfInMemBlockPermits > 0) {
-      synchronized (suspendedClients) {
-        for (AbstractClient client : suspendedClients) {
-          resumedSuspendedClients |= client.resumeReadIfSuspended();
-        }
-        suspendedClients.clear();
-      }
+      resumedSuspendedClients = resumeSuspendedClients();
     } else {
       logger.debug("Keeping clients: {} suspended, numberOfInMemBlockPermits={}, Listeners: {}", suspendedClients,
           numberOfInMemBlockPermits, all_listeners);
@@ -414,9 +409,46 @@ public class DataList
     return resumedSuspendedClients;
   }
 
+  private boolean resumeSuspendedClients()
+  {
+    boolean resumedSuspendedClients = false;
+    synchronized (suspendedClients) {
+      for (AbstractClient client : suspendedClients) {
+        resumedSuspendedClients |= client.resumeReadIfSuspended();
+      }
+      suspendedClients.clear();
+    }
+    return resumedSuspendedClients;
+  }
+
   public boolean isMemoryBlockAvailable()
   {
-    return (storage == null) || (numberOfInMemBlockPermits.get() > 0);
+    return (numberOfInMemBlockPermits.get() > 0);
+  }
+
+  public boolean areSubscribersBehindByMax()
+  {
+    boolean behind = false;
+    if (backPressureEnabled) {
+      // Seek to max blocks and see if any block is in use beyond that
+      int count = 0;
+      synchronized (this) {
+        Block curr = last.prev;
+        // go back the max number of blocks
+        while ((curr != null) && (++count < (MAX_COUNT_OF_INMEM_BLOCKS - 2))) {
+          curr = curr.prev;
+        }
+        // check if any block is in use
+        while (!behind && (curr != null)) {
+          // Since acquire happens before release, because of concurrency, in a corner case scenario we might still count a
+          // subscriber as being max behind when it is transitioning over to the next block but that is ok as it will only
+          // result in publisher blocking for some time and resuming
+          behind = (curr.refCount.get() != 0);
+          curr = curr.prev;
+        }
+      }
+    }
+    return behind;
   }
 
   public byte[] newBuffer(final int size)
@@ -436,7 +468,8 @@ public class DataList
       logger.warn("Exceeded allowed memory block allocation by {}", -numberOfInMemBlockPermits);
     }
     last.next = new Block(identifier, array, last.ending_window, last.ending_window);
-    last.release(false);
+    last.next.prev = last;
+    last.release(false, true);
     last = last.next;
   }
 
@@ -469,7 +502,7 @@ public class DataList
 
     // When the number of subscribers becomes high or the number of blocks becomes high, consider optimize it.
     Block b = first;
-    Map<Block, Integer> indices = new HashMap<Block, Integer>();
+    Map<Block, Integer> indices = new HashMap<>();
     int i = 0;
     while (b != null) {
       indices.put(b, i++);
@@ -514,7 +547,7 @@ public class DataList
   @Override
   public String toString()
   {
-    return getClass().getName() + '@' + Integer.toHexString(hashCode()) + " {" + identifier + '}';
+    return new ToStringBuilder(this, ToStringStyle.DEFAULT).append("identifier", identifier).toString();
   }
 
   /**
@@ -553,6 +586,10 @@ public class DataList
      * the next in the chain.
      */
     Block next;
+    /**
+     * the previous in the chain
+     */
+    Block prev;
     /**
      * how count of references to this block.
      */
@@ -822,27 +859,86 @@ public class DataList
       };
     }
 
-    protected void release(boolean wait)
+    protected void release(boolean wait, boolean writer)
     {
       final int refCount = this.refCount.decrementAndGet();
-      if (refCount == 0 && storage != null) {
+      if (canEvict(refCount, writer)) {
         assert (next != null);
-        final Runnable storer = getStorer(data, readingOffset, writingOffset, storage);
-        if (future != null && future.cancel(false)) {
-          logger.debug("Block {} future is cancelled", this);
-        }
-        final int numberOfInMemBlockPermits = DataList.this.numberOfInMemBlockPermits.get();
-        if (wait && numberOfInMemBlockPermits == 0) {
-          future = null;
-          storer.run();
-        } else if (numberOfInMemBlockPermits < MAX_COUNT_OF_INMEM_BLOCKS / 2) {
-          future = storageExecutor.submit(storer);
+        if (storage != null) {
+          evictBlock(wait);
         } else {
-          future = null;
+          if (!isPublisherAheadByMax()) {
+            resumeSuspendedClients();
+          }
         }
-      } else {
-        logger.debug("Holding {} in memory due to {} references.", this, refCount);
       }
+    }
+
+    private void evictBlock(boolean wait)
+    {
+      final Runnable storer = getStorer(data, readingOffset, writingOffset, storage);
+      if (future != null && future.cancel(false)) {
+        logger.debug("Block {} future is cancelled", this);
+      }
+      final int numberOfInMemBlockPermits = DataList.this.numberOfInMemBlockPermits.get();
+      if (wait && numberOfInMemBlockPermits == 0) {
+        future = null;
+        storer.run();
+      } else if (numberOfInMemBlockPermits < MAX_COUNT_OF_INMEM_BLOCKS / 2) {
+        future = storageExecutor.submit(storer);
+      } else {
+        future = null;
+      }
+    }
+
+    private boolean canEvict(final int refCount, boolean writer)
+    {
+      if (refCount == 0) {
+        if (backPressureEnabled) {
+          if (!writer) {
+            boolean evict = true;
+            // Search backwards from current block as opposed to searching forward from first block till current block as
+            // it is more likely to find the match quicker.
+            synchronized (this) {
+              for (Block temp = this.prev; temp != null; temp = temp.prev) {
+                if (temp.refCount.get() != 0) {
+                  evict = false;
+                  break;
+                }
+              }
+            }
+            logger.debug("Block {} evict {}", this, evict);
+            return evict;
+          } else {
+            return false;
+          }
+        } else {
+          return true;
+        }
+      }
+      logger.debug("Not evicting {} due to {} references.", this, refCount);
+      return false;
+    }
+
+    private boolean isPublisherAheadByMax()
+    {
+      boolean ahead = false;
+      if (backPressureEnabled) {
+        int blocks = MAX_COUNT_OF_INMEM_BLOCKS;
+        synchronized (DataList.this) {
+          Block curr = this.next;
+          // seek till the next block that is in use to determine possible active subscriber
+          while ((curr != null) && (curr.refCount.get() == 0)) {
+            curr = curr.next;
+          }
+          // find if publisher is ahead by max
+          while (!ahead && (curr != null)) {
+            ahead = (--blocks == 0);
+            curr = curr.next;
+          }
+        }
+      }
+      return ahead;
     }
 
     private Runnable getDiscarder()
@@ -937,7 +1033,7 @@ public class DataList
       }
       //logger.debug("{}: switching to the next block {}->{}", this, da, da.next);
       next.acquire(true);
-      da.release(false);
+      da.release(false, false);
       da = next;
       size = 0;
       buffer = da.data;
@@ -1008,7 +1104,7 @@ public class DataList
     public void close()
     {
       if (da != null) {
-        da.release(false);
+        da.release(false, false);
         da = null;
         buffer = null;
       }
@@ -1028,5 +1124,90 @@ public class DataList
 
   }
 
-  private static final Logger logger = LoggerFactory.getLogger(DataList.class);
+  private class ListenersNotifier implements Runnable
+  {
+    private volatile Future<?> future;
+    private boolean isMoreDataAvailable = false;
+
+    private void moreDataAvailable()
+    {
+      final Future<?> future = this.future;
+      if (future == null || future.isDone() || future.isCancelled()) {
+        // Do not schedule a new task if there is an existing one that is still running or is waiting in the queue
+        this.future = autoFlushExecutor.submit(this);
+      } else {
+        synchronized (this) {
+          if (this.future == null) {
+            // future is set to null before run() exists, no need to check whether future isDone() or isCancelled()
+            this.future = autoFlushExecutor.submit(this);
+          } else {
+            isMoreDataAvailable = true;
+          }
+        }
+      }
+    }
+
+    private boolean addedData()
+    {
+      boolean doesAtLeastOneListenerHaveDataToSend = false;
+      for (DataListener dl : all_listeners) {
+        try {
+          doesAtLeastOneListenerHaveDataToSend |= dl.addedData(false);
+        } catch (RuntimeException e) {
+          logger.warn("{} removing {} due to exception", this, dl, e);
+          removeDataListener(dl);
+          break;
+        }
+      }
+      return doesAtLeastOneListenerHaveDataToSend;
+    }
+
+    private boolean checkIfListenersHaveDataToSendOnly()
+    {
+      for (DataListener dl : all_listeners) {
+        try {
+          if (dl.addedData(true)) {
+            return true;
+          }
+        } catch (RuntimeException e) {
+          logger.warn("{} removing {} due to exception", this, dl, e);
+          removeDataListener(dl);
+          return checkIfListenersHaveDataToSendOnly();
+        }
+      }
+      return false;
+    }
+
+    @Override
+    public void run()
+    {
+      logger.debug("{} entered run", this);
+      try {
+        if (addedData() || checkIfListenersHaveDataToSendOnly()) {
+          future = autoFlushExecutor.submit(this);
+        } else {
+          synchronized (this) {
+            if (isMoreDataAvailable) {
+              isMoreDataAvailable = false;
+              future = autoFlushExecutor.submit(this);
+            } else {
+              future = null;
+            }
+          }
+        }
+      } catch (RuntimeException e) {
+        logger.warn("{}", this, e);
+      } finally {
+        logger.debug("{} exiting run", this);
+      }
+    }
+
+    @Override
+    public String toString()
+    {
+      return new ToStringBuilder(this, ToStringStyle.DEFAULT).append(DataList.this)
+          .append("future", future == null ? null : future.getClass().getSimpleName() + '@' + Integer.toHexString(System.identityHashCode(future)))
+          .append("isMoreDataAvailable", isMoreDataAvailable).toString();
+    }
+  }
 }

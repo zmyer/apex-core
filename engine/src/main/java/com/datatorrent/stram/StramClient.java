@@ -37,6 +37,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.apex.common.util.JarHelper;
+import org.apache.apex.engine.security.ACLManager;
 
 import org.apache.commons.io.IOUtils;
 import org.apache.commons.lang.ArrayUtils;
@@ -78,6 +79,7 @@ import com.google.common.collect.Lists;
 
 import com.datatorrent.api.Context;
 import com.datatorrent.api.Context.OperatorContext;
+import com.datatorrent.api.Context.SSLConfig;
 import com.datatorrent.api.StorageAgent;
 import com.datatorrent.common.util.AsyncFSStorageAgent;
 import com.datatorrent.common.util.BasicContainerOptConfigurator;
@@ -101,6 +103,8 @@ public class StramClient
   @Deprecated
   public static final String YARN_APPLICATION_TYPE_DEPRECATED = "DataTorrent";
 
+  private static final String javaCmd = "${JAVA_HOME}" + "/bin/java";
+
   public static final String LIB_JARS_SEP = ",";
 
   // Configuration
@@ -112,7 +116,6 @@ public class StramClient
   private final int amPriority = 0;
   private ApplicationId appId;
   private final LogicalPlan dag;
-  public String javaCmd = "${JAVA_HOME}" + "/bin/java";
   // log4j.properties file
   // if available, add to local resources and set into classpath
   private final String log4jPropFile = "";
@@ -153,6 +156,7 @@ public class StramClient
   };
 
   private static final Class<?>[] APEX_SECURITY_SPECIFIC_CLASSES = new Class<?>[]{
+      com.sun.jersey.client.apache4.ApacheHttpClient4Handler.class
   };
 
   private static final Class<?>[] APEX_SECURITY_CLASSES =
@@ -176,7 +180,7 @@ public class StramClient
     yarnClient.stop();
   }
 
-  public static LinkedHashSet<String> findJars(LogicalPlan dag, Class<?>[] defaultClasses)
+  public LinkedHashSet<String> findJars(Class<?>[] defaultClasses)
   {
     List<Class<?>> jarClasses = new ArrayList<>();
 
@@ -208,10 +212,7 @@ public class StramClient
     JarHelper jarHelper = new JarHelper();
 
     for (Class<?> jarClass : jarClasses) {
-      String jar = jarHelper.getJar(jarClass);
-      if (jar != null) {
-        localJarFiles.add(jar);
-      }
+      localJarFiles.addAll(jarHelper.getJars(jarClass));
     }
 
     String libJarsPath = dag.getValue(Context.DAGContext.LIBRARY_JARS);
@@ -220,7 +221,18 @@ public class StramClient
       localJarFiles.addAll(Arrays.asList(libJars));
     }
 
-    LOG.info("Local jar file dependencies: " + localJarFiles);
+    String pluginClassesPaths = conf.get(StreamingAppMasterService.PLUGINS_CONF_KEY);
+    if (!StringUtils.isEmpty(pluginClassesPaths)) {
+      for (String pluginClassPath : StringUtils.splitByWholeSeparator(pluginClassesPaths, StreamingAppMasterService.PLUGINS_CONF_SEP)) {
+        try {
+          localJarFiles.addAll(jarHelper.getJars(Thread.currentThread().getContextClassLoader().loadClass(pluginClassPath)));
+        } catch (ClassNotFoundException ex) {
+          LOG.error("Cannot find the class {}", pluginClassPath, ex);
+        }
+      }
+    }
+
+    LOG.info("Local jar file dependencies: {}", localJarFiles);
 
     return localJarFiles;
   }
@@ -256,6 +268,7 @@ public class StramClient
   public void copyInitialState(Path origAppDir) throws IOException
   {
     // locate previous snapshot
+    long copyStart = System.currentTimeMillis();
     String newAppDir = this.dag.assertAppPath();
 
     FSRecoveryHandler recoveryHandler = new FSRecoveryHandler(origAppDir.toString(), conf);
@@ -283,6 +296,7 @@ public class StramClient
     logOs.close();
     logIs.close();
 
+    List<String> excludeDirs = Arrays.asList(LogicalPlan.SUBDIR_CHECKPOINTS, LogicalPlan.SUBDIR_EVENTS, LogicalPlan.SUBDIR_STATS);
     // copy sub directories that are not present in target
     FileStatus[] lFiles = fs.listStatus(origAppDir);
 
@@ -297,19 +311,19 @@ public class StramClient
     String newAppDirPath = Path.getPathWithoutSchemeAndAuthority(new Path(newAppDir)).toString();
 
     for (FileStatus f : lFiles) {
-      if (f.isDirectory()) {
+      if (f.isDirectory() && !excludeDirs.contains(f.getPath().getName())) {
         String targetPath = f.getPath().toString().replace(origAppDirPath, newAppDirPath);
         if (!fs.exists(new Path(targetPath))) {
-          LOG.debug("Copying {} to {}", f.getPath(), targetPath);
+          LOG.debug("Copying {} size {} to {}", f.getPath(), f.getLen(), targetPath);
+          long start = System.currentTimeMillis();
           FileUtil.copy(fs, f.getPath(), fs, new Path(targetPath), false, conf);
-          //FSUtil.copy(fs, f, fs, new Path(targetPath), false, false, conf);
+          LOG.debug("Copying {} to {} took {} ms", f.getPath(), f.getLen(), targetPath, System.currentTimeMillis() - start);
         } else {
           LOG.debug("Ignoring {} as it already exists under {}", f.getPath(), targetPath);
-          //FSUtil.setPermission(fs, new Path(targetPath), new FsPermission((short)0777));
         }
       }
     }
-
+    LOG.info("Copying initial state took {} ms", System.currentTimeMillis() - copyStart);
   }
 
   /**
@@ -333,7 +347,7 @@ public class StramClient
       throw new IllegalStateException(applicationType + " is not a valid application type.");
     }
 
-    LinkedHashSet<String> localJarFiles = findJars(dag, defaultClasses);
+    LinkedHashSet<String> localJarFiles = findJars(defaultClasses);
 
     if (resources != null) {
       localJarFiles.addAll(resources);
@@ -391,6 +405,8 @@ public class StramClient
       //appContext.setMaxAppAttempts(1); // no retries until Stram is HA
     }
 
+    appContext.setKeepContainersAcrossApplicationAttempts(true);
+
     // Set up the container launch context for the application master
     ContainerLaunchContext amContainer = Records.newRecord(ContainerLaunchContext.class);
 
@@ -426,6 +442,12 @@ public class StramClient
       amContainer.setTokens(fsTokens);
     }
 
+    // Setup ACLs for the impersonating user
+    LOG.debug("ACL login user {} current user {}", UserGroupInformation.getLoginUser(), UserGroupInformation.getCurrentUser());
+    if (!UserGroupInformation.getCurrentUser().equals(UserGroupInformation.getLoginUser())) {
+      ACLManager.setupUserACLs(amContainer, UserGroupInformation.getLoginUser().getShortUserName(), conf);
+    }
+
     // set local resources for the application master
     // local files or archives as needed
     // In this scenario, the jar file for the application master is part of the local resources
@@ -433,7 +455,7 @@ public class StramClient
 
     // copy required jar files to dfs, to be localized for containers
     try (FileSystem fs = StramClientUtils.newFileSystemInstance(conf)) {
-      Path appsBasePath = new Path(StramClientUtils.getDTDFSRootDir(fs, conf), StramClientUtils.SUBDIR_APPS);
+      Path appsBasePath = new Path(StramClientUtils.getApexDFSRootDir(fs, conf), StramClientUtils.SUBDIR_APPS);
       Path appPath;
       String configuredAppPath = dag.getValue(LogicalPlan.APPLICATION_PATH);
       if (configuredAppPath == null) {
@@ -442,6 +464,7 @@ public class StramClient
         appPath = new Path(configuredAppPath);
       }
       String libJarsCsv = copyFromLocal(fs, appPath, localJarFiles.toArray(new String[]{}));
+      setupSSLResources(dag.getValue(Context.DAGContext.SSL_CONFIG), fs, appPath, localResources);
 
       LOG.info("libjars: {}", libJarsCsv);
       dag.getAttributes().put(Context.DAGContext.LIBRARY_JARS, libJarsCsv);
@@ -541,6 +564,7 @@ public class StramClient
       }
       env.put("CLASSPATH", classPathEnv.toString());
       // propagate to replace node managers user name (effective in non-secure mode)
+      // also to indicate original login user during impersonation and important for setting ACLs
       env.put("HADOOP_USER_NAME", UserGroupInformation.getLoginUser().getUserName());
 
       amContainer.setEnvironment(env);
@@ -567,6 +591,8 @@ public class StramClient
       vargs.add("-Dhadoop.root.logger=" + (dag.isDebug() ? "DEBUG" : "INFO") + ",RFA");
       vargs.add("-Dhadoop.log.dir=" + ApplicationConstants.LOG_DIR_EXPANSION_VAR);
       vargs.add(String.format("-D%s=%s", StreamingContainer.PROP_APP_PATH, dag.assertAppPath()));
+      StramClientUtils.addAttributeToArgs(LogicalPlan.APPLICATION_NAME, dag, vargs);
+      StramClientUtils.addAttributeToArgs(LogicalPlan.LOGGER_APPENDER, dag, vargs);
       if (dag.isDebug()) {
         vargs.add("-Dlog4j.debug=true");
       }
@@ -626,6 +652,37 @@ public class StramClient
         //LOG.info("Full submission context: " + appContext);
       }
       yarnClient.submitApplication(appContext);
+    }
+  }
+
+  /**
+   * Process SSLConfig object to set up SSL resources
+   *
+   * @param sslConfig  SSLConfig object derived from SSL_CONFIG attribute
+   * @param fs    HDFS file system object
+   * @param appPath    application path for the current application
+   * @param localResources  Local resources to modify
+   * @throws IOException
+   */
+  private void setupSSLResources(SSLConfig sslConfig, FileSystem fs, Path appPath, Map<String, LocalResource> localResources) throws IOException
+  {
+    if (sslConfig != null) {
+      String nodeLocalConfig = sslConfig.getConfigPath();
+
+      if (StringUtils.isNotEmpty(nodeLocalConfig)) {
+        // all others should be empty
+        if (StringUtils.isNotEmpty(sslConfig.getKeyStorePath()) || StringUtils.isNotEmpty(sslConfig.getKeyStorePassword())
+            || StringUtils.isNotEmpty(sslConfig.getKeyStoreKeyPassword())) {
+          throw new IllegalArgumentException("Cannot specify both nodeLocalConfigPath and other parameters in " + sslConfig);
+        }
+        // pass thru: Stram will implement reading the node local SSL config file
+      } else {
+        // need to package and copy the keyStore file
+        String keystorePath = sslConfig.getKeyStorePath();
+        String[] sslFileArray = {keystorePath};
+        String sslFileNames = copyFromLocal(fs, appPath, sslFileArray);
+        LaunchContainerRunnable.addFilesToLocalResources(LocalResourceType.FILE, sslFileNames, localResources, fs);
+      }
     }
   }
 

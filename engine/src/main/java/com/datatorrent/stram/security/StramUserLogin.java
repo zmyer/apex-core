@@ -51,6 +51,7 @@ public class StramUserLogin
   public static final String DT_AUTH_PREFIX = StreamingApplication.DT_PREFIX + "authentication.";
   public static final String DT_AUTH_PRINCIPAL = DT_AUTH_PREFIX + "principal";
   public static final String DT_AUTH_KEYTAB = DT_AUTH_PREFIX + "keytab";
+  public static final String DT_APP_PATH_IMPERSONATED = DT_AUTH_PREFIX + "impersonation.path.enable";
   private static String principal;
   private static String keytab;
 
@@ -109,21 +110,13 @@ public class StramUserLogin
         public Object run() throws Exception
         {
 
-          YarnClient yarnClient = null;
-          if (renewRMToken) {
-            yarnClient = YarnClient.createYarnClient();
-            yarnClient.init(conf);
-            yarnClient.start();
-          }
           Credentials creds = new Credentials();
           try (FileSystem fs1 = FileSystem.newInstance(conf)) {
             fs1.addDelegationTokens(tokenRenewer, creds);
-            if (renewRMToken) {
+          }
+          if (renewRMToken) {
+            try (YarnClient yarnClient = StramClientUtils.createYarnClient(conf)) {
               new StramClientUtils.ClientRMHelper(yarnClient, conf).addRMDelegationToken(tokenRenewer, creds);
-            }
-          } finally {
-            if (renewRMToken) {
-              yarnClient.stop();
             }
           }
           credentials.addAll(creds);

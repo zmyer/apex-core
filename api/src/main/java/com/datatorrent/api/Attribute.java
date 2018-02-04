@@ -29,6 +29,8 @@ import java.util.Set;
 
 import com.google.common.base.Throwables;
 
+import static com.datatorrent.api.StreamingApplication.APEX_PREFIX;
+
 /**
  * Attribute represents the attribute which can be set on various components in the system.
  *
@@ -88,6 +90,11 @@ public class Attribute<T> implements Serializable
     return "attr" + name.substring(name.lastIndexOf('.'));
   }
 
+  public String getLongName()
+  {
+    return APEX_PREFIX + getSimpleName().replaceAll("_",".").toLowerCase();
+  }
+
   public String getSimpleName()
   {
     return name.substring(name.lastIndexOf('.') + 1);
@@ -107,7 +114,7 @@ public class Attribute<T> implements Serializable
    *
    * @since 0.3.2
    */
-  public static interface AttributeMap extends Cloneable
+  public interface AttributeMap extends Cloneable
   {
     /**
      * Return the attribute value for the given key. If the map does not have an
@@ -150,7 +157,7 @@ public class Attribute<T> implements Serializable
     /**
      * DefaultAttributeMap is the default implementation of AttributeMap. It's backed by a map internally.
      */
-    public static class DefaultAttributeMap implements AttributeMap, Serializable
+    class DefaultAttributeMap implements AttributeMap, Serializable
     {
       private HashMap<Attribute<?>, Object> map;
 
@@ -234,13 +241,13 @@ public class Attribute<T> implements Serializable
      *
      * Engine uses it internally to initialize the Interfaces that may have Attributes defined in them.
      */
-    public static class AttributeInitializer
+    class AttributeInitializer
     {
-      static final HashMap<Class<?>, Set<Attribute<Object>>> map = new HashMap<Class<?>, Set<Attribute<Object>>>();
+      static final HashMap<Class<?>, Set<Attribute<Object>>> map = new HashMap<>();
 
       public static Map<Attribute<Object>, Object> getAllAttributes(Context context, Class<?> clazz)
       {
-        Map<Attribute<Object>, Object> result = new HashMap<Attribute<Object>, Object>();
+        Map<Attribute<Object>, Object> result = new HashMap<>();
         try {
           for (Field f: clazz.getDeclaredFields()) {
             if (Modifier.isStatic(f.getModifiers()) && Attribute.class.isAssignableFrom(f.getType())) {
@@ -273,7 +280,7 @@ public class Attribute<T> implements Serializable
         if (map.containsKey(clazz)) {
           return 0;
         }
-        Set<Attribute<Object>> set = new HashSet<Attribute<Object>>();
+        Set<Attribute<Object>> set = new HashSet<>();
         try {
           for (Field f: clazz.getDeclaredFields()) {
             if (Modifier.isStatic(f.getModifiers()) && Attribute.class.isAssignableFrom(f.getType())) {

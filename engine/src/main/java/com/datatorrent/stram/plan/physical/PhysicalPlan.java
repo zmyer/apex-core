@@ -41,6 +41,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.apex.common.util.AsyncStorageAgent;
 import org.apache.commons.lang.StringUtils;
 
 import com.google.common.annotations.VisibleForTesting;
@@ -65,10 +66,11 @@ import com.datatorrent.api.Partitioner.Partition;
 import com.datatorrent.api.Partitioner.PartitionKeys;
 import com.datatorrent.api.StatsListener;
 import com.datatorrent.api.StatsListener.OperatorRequest;
+import com.datatorrent.api.StatsListener.StatsListenerContext;
+import com.datatorrent.api.StatsListener.StatsListenerWithContext;
 import com.datatorrent.api.StorageAgent;
 import com.datatorrent.api.StreamCodec;
 import com.datatorrent.api.annotation.Stateless;
-import com.datatorrent.common.util.AsyncFSStorageAgent;
 import com.datatorrent.stram.Journal.Recoverable;
 import com.datatorrent.stram.api.Checkpoint;
 import com.datatorrent.stram.api.StramEvent;
@@ -137,6 +139,7 @@ public class PhysicalPlan implements Serializable
 
   private final AtomicInteger strCodecIdSequence = new AtomicInteger();
   private final Map<StreamCodec<?>, Integer> streamCodecIdentifiers = Maps.newHashMap();
+  private StatsListenerContext statsListenerContext = new StatsListenerContextImpl();
 
   private PTContainer getContainer(int index)
   {
@@ -190,7 +193,10 @@ public class PhysicalPlan implements Serializable
     void addOperatorRequest(PTOperator oper, StramToNodeRequest request);
   }
 
-  private static class StatsListenerProxy implements StatsListener, Serializable
+  /**
+   * Adapter for handling operator implementing StatsListener interface.
+   */
+  private static class StatsListenerProxy implements StatsListenerWithContext, Serializable
   {
     private static final long serialVersionUID = 201312112033L;
     private final OperatorMeta om;
@@ -205,6 +211,53 @@ public class PhysicalPlan implements Serializable
     {
       return ((StatsListener)om.getOperator()).processStats(stats);
     }
+
+    @Override
+    public Response processStats(BatchedOperatorStats stats, StatsListenerContext context)
+    {
+      StatsListener listener = (StatsListener)om.getOperator();
+      if (listener instanceof StatsListenerWithContext) {
+        return ((StatsListenerWithContext)listener).processStats(stats, context);
+      } else {
+        return processStats(stats);
+      }
+    }
+  }
+
+  /**
+   * Adapter for handling deprecated StatsListener. This implementation calls {@link StatsListener#processStats(BatchedOperatorStats)}
+   * of the old stats listener ignoring context.
+   */
+  private static class StatsListenerAdapterForStatsListener implements  StatsListener.StatsListenerWithContext, Serializable
+  {
+    private static final long serialVersionUID = 201312112345033L;
+    private final StatsListener listener;
+
+    private StatsListenerAdapterForStatsListener(StatsListener listener)
+    {
+      this.listener = listener;
+    }
+
+    @Override
+    public Response processStats(BatchedOperatorStats stats)
+    {
+      return listener.processStats(stats);
+    }
+
+    @Override
+    public Response processStats(BatchedOperatorStats stats, StatsListenerContext context)
+    {
+      return listener.processStats(stats);
+    }
+  }
+
+  private static StatsListenerWithContext getStatsListenerAdapter(StatsListener listener)
+  {
+    if (listener instanceof StatsListenerWithContext) {
+      return (StatsListenerWithContext)listener;
+    } else {
+      return new StatsListenerAdapterForStatsListener(listener);
+    }
   }
 
   /**
@@ -217,7 +270,7 @@ public class PhysicalPlan implements Serializable
     private final OperatorMeta logicalOperator;
     private List<PTOperator> partitions = new LinkedList<>();
     private final Map<LogicalPlan.OutputPortMeta, StreamMapping> outputStreams = Maps.newHashMap();
-    private List<StatsListener> statsHandlers;
+    private List<StatsListenerWithContext> statsHandlers;
 
     /**
      * Operators that form a parallel partition
@@ -477,13 +530,13 @@ public class PhysicalPlan implements Serializable
     // Log container anti-affinity
     if (LOG.isDebugEnabled()) {
       for (PTContainer container : containers) {
-        List<String> antiOperators = new ArrayList<String>();
+        List<String> antiOperators = new ArrayList<>();
         for (PTContainer c : container.getStrictAntiPrefs()) {
           for (PTOperator operator : c.getOperators()) {
             antiOperators.add(operator.getName());
           }
         }
-        List<String> containerOperators = new ArrayList<String>();
+        List<String> containerOperators = new ArrayList<>();
         for (PTOperator operator : container.getOperators()) {
           containerOperators.add(operator.getName());
         }
@@ -543,7 +596,7 @@ public class PhysicalPlan implements Serializable
         for (StreamMeta s : n.getOutputStreams().values()) {
           if (s.getPersistOperator() != null) {
             InputPortMeta persistInputPort = s.getPersistOperatorInputPort();
-            StreamCodecWrapperForPersistance<?> persistCodec = (StreamCodecWrapperForPersistance<?>)persistInputPort.getAttributes().get(PortContext.STREAM_CODEC);
+            StreamCodecWrapperForPersistance<?> persistCodec = (StreamCodecWrapperForPersistance<?>)persistInputPort.getStreamCodec();
             if (persistCodec == null) {
               continue;
             }
@@ -556,12 +609,9 @@ public class PhysicalPlan implements Serializable
           // Check partitioning for persist operators per sink too
           for (Map.Entry<InputPortMeta, InputPortMeta> entry : s.sinkSpecificPersistInputPortMap.entrySet()) {
             InputPortMeta persistInputPort = entry.getValue();
-            StreamCodec<?> codec = persistInputPort.getAttributes().get(PortContext.STREAM_CODEC);
-            if (codec != null) {
-              if (codec instanceof StreamCodecWrapperForPersistance) {
-                StreamCodecWrapperForPersistance<?> persistCodec = (StreamCodecWrapperForPersistance<?>)codec;
-                updatePersistOperatorWithSinkPartitions(persistInputPort, s.sinkSpecificPersistOperatorMap.get(entry.getKey()), persistCodec, entry.getKey());
-              }
+            StreamCodec<?> streamCodec = persistInputPort.getStreamCodec();
+            if (streamCodec != null && streamCodec instanceof StreamCodecWrapperForPersistance) {
+              updatePersistOperatorWithSinkPartitions(persistInputPort, s.sinkSpecificPersistOperatorMap.get(entry.getKey()), (StreamCodecWrapperForPersistance<?>)streamCodec, entry.getKey());
             }
           }
         }
@@ -573,7 +623,7 @@ public class PhysicalPlan implements Serializable
 
   private void updatePersistOperatorWithSinkPartitions(InputPortMeta persistInputPort, OperatorMeta persistOperatorMeta, StreamCodecWrapperForPersistance<?> persistCodec, InputPortMeta sinkPortMeta)
   {
-    Collection<PTOperator> ptOperators = getOperators(sinkPortMeta.getOperatorWrapper());
+    Collection<PTOperator> ptOperators = getOperators(sinkPortMeta.getOperatorMeta());
     Collection<PartitionKeys> partitionKeysList = new ArrayList<>();
     for (PTOperator p : ptOperators) {
       PartitionKeys keys = p.partitionKeys.get(sinkPortMeta);
@@ -593,8 +643,7 @@ public class PhysicalPlan implements Serializable
             Map<InputPortMeta, StreamCodec<?>> inputStreamCodecs = new HashMap<>();
             // Logging is enabled for the stream
             for (InputPortMeta portMeta : s.getSinksToPersist()) {
-              InputPort<?> port = portMeta.getPortObject();
-              StreamCodec<?> inputStreamCodec = (portMeta.getValue(PortContext.STREAM_CODEC) != null) ? portMeta.getValue(PortContext.STREAM_CODEC) : port.getStreamCodec();
+              StreamCodec<?> inputStreamCodec = portMeta.getStreamCodec();
               if (inputStreamCodec != null) {
                 boolean alreadyAdded = false;
 
@@ -619,7 +668,7 @@ public class PhysicalPlan implements Serializable
               // Create Wrapper codec for Stream persistence using all unique
               // stream codecs
               // Logger should write merged or union of all input stream codecs
-              StreamCodec<?> specifiedCodecForLogger = (s.getPersistOperatorInputPort().getValue(PortContext.STREAM_CODEC) != null) ? s.getPersistOperatorInputPort().getValue(PortContext.STREAM_CODEC) : s.getPersistOperatorInputPort().getPortObject().getStreamCodec();
+              StreamCodec<?> specifiedCodecForLogger = s.getPersistOperatorInputPort().getStreamCodec();
               @SuppressWarnings({ "unchecked", "rawtypes" })
               StreamCodecWrapperForPersistance<Object> codec = new StreamCodecWrapperForPersistance(inputStreamCodecs, specifiedCodecForLogger);
               streamMetaToCodecMap.put(s, codec);
@@ -629,7 +678,7 @@ public class PhysicalPlan implements Serializable
       }
 
       for (java.util.Map.Entry<StreamMeta, StreamCodec<?>> entry : streamMetaToCodecMap.entrySet()) {
-        dag.setInputPortAttribute(entry.getKey().getPersistOperatorInputPort().getPortObject(), PortContext.STREAM_CODEC, entry.getValue());
+        dag.setInputPortAttribute(entry.getKey().getPersistOperatorInputPort().getPort(), PortContext.STREAM_CODEC, entry.getValue());
       }
     } catch (Exception e) {
       throw Throwables.propagate(e);
@@ -768,7 +817,9 @@ public class PhysicalPlan implements Serializable
       if (m.statsHandlers == null) {
         m.statsHandlers = new ArrayList<>(statsListeners.size());
       }
-      m.statsHandlers.addAll(statsListeners);
+      for (StatsListener sl : statsListeners) {
+        m.statsHandlers.add(getStatsListenerAdapter(sl));
+      }
     }
 
     if (m.logicalOperator.getOperator() instanceof StatsListener) {
@@ -1230,11 +1281,8 @@ public class PhysicalPlan implements Serializable
       long windowId = oper.isOperatorStateLess() ? Stateless.WINDOW_ID : checkpoint.windowId;
       StorageAgent agent = oper.operatorMeta.getValue(OperatorContext.STORAGE_AGENT);
       agent.save(oo, oper.id, windowId);
-      if (agent instanceof AsyncFSStorageAgent) {
-        AsyncFSStorageAgent asyncFSStorageAgent = (AsyncFSStorageAgent)agent;
-        if (!asyncFSStorageAgent.isSyncCheckpoint()) {
-          asyncFSStorageAgent.copyToHDFS(oper.id, windowId);
-        }
+      if (agent instanceof AsyncStorageAgent) {
+        ((AsyncStorageAgent)agent).flush(oper.id, windowId);
       }
     } catch (IOException e) {
       // inconsistent state, no recovery option, requires shutdown
@@ -1326,7 +1374,7 @@ public class PhysicalPlan implements Serializable
       // copy list as it is modified by recursive remove
       for (PTInput in : Lists.newArrayList(out.sinks)) {
         for (LogicalPlan.InputPortMeta im : in.logicalStream.getSinks()) {
-          PMapping m = this.logicalToPTOperator.get(im.getOperatorWrapper());
+          PMapping m = this.logicalToPTOperator.get(im.getOperatorMeta());
           if (m.parallelPartitions == operatorMapping.parallelPartitions) {
             // associated operator parallel partitioned
             removePartition(in.target, operatorMapping);
@@ -1439,7 +1487,7 @@ public class PhysicalPlan implements Serializable
     List<InputPort<?>> inputPortList = Lists.newArrayList();
 
     for (InputPortMeta inputPortMeta: operatorMeta.getInputStreams().keySet()) {
-      inputPortList.add(inputPortMeta.getPortObject());
+      inputPortList.add(inputPortMeta.getPort());
     }
 
     return inputPortList;
@@ -1447,7 +1495,7 @@ public class PhysicalPlan implements Serializable
 
   void removePTOperator(PTOperator oper)
   {
-    LOG.debug("Removing operator " + oper);
+    LOG.debug("Removing operator {}", oper);
 
     // per partition merge operators
     if (!oper.upstreamMerge.isEmpty()) {
@@ -1609,7 +1657,7 @@ public class PhysicalPlan implements Serializable
         for (PTInput in : operator.inputs) {
           if (in.logicalStream.getPersistOperator() != null) {
             for (InputPortMeta inputPort : in.logicalStream.getSinksToPersist()) {
-              if (inputPort.getOperatorWrapper().equals(operator.operatorMeta)) {
+              if (inputPort.getOperatorMeta().equals(operator.operatorMeta)) {
                 // Redeploy the stream wide persist operator only if the current sink is being persisted
                 persistOperators.addAll(getOperators(in.logicalStream.getPersistOperator()));
                 break;
@@ -1689,7 +1737,7 @@ public class PhysicalPlan implements Serializable
   {
     // remove incoming connections for logical stream
     for (InputPortMeta ipm : sm.getSinks()) {
-      OperatorMeta om = ipm.getOperatorWrapper();
+      OperatorMeta om = ipm.getOperatorMeta();
       PMapping m = this.logicalToPTOperator.get(om);
       if (m == null) {
         throw new AssertionError("Unknown operator " + om);
@@ -1735,7 +1783,7 @@ public class PhysicalPlan implements Serializable
    */
   public void connectInput(InputPortMeta ipm)
   {
-    for (Map.Entry<LogicalPlan.InputPortMeta, StreamMeta> inputEntry : ipm.getOperatorWrapper().getInputStreams().entrySet()) {
+    for (Map.Entry<LogicalPlan.InputPortMeta, StreamMeta> inputEntry : ipm.getOperatorMeta().getInputStreams().entrySet()) {
       if (inputEntry.getKey() == ipm) {
         // initialize outputs for existing operators
         for (Map.Entry<LogicalPlan.OutputPortMeta, StreamMeta> outputEntry : inputEntry.getValue().getSource().getOperatorMeta().getOutputStreams().entrySet()) {
@@ -1746,7 +1794,7 @@ public class PhysicalPlan implements Serializable
             deployOpers.add(oper);
           }
         }
-        PMapping m = this.logicalToPTOperator.get(ipm.getOperatorWrapper());
+        PMapping m = this.logicalToPTOperator.get(ipm.getOperatorMeta());
         updateStreamMappings(m);
         for (PTOperator oper : m.partitions) {
           undeployOpers.add(oper);
@@ -1793,8 +1841,8 @@ public class PhysicalPlan implements Serializable
 
   public void onStatusUpdate(PTOperator oper)
   {
-    for (StatsListener l : oper.statsListeners) {
-      final StatsListener.Response rsp = l.processStats(oper.stats);
+    for (StatsListenerWithContext l : oper.statsListeners) {
+      final StatsListener.Response rsp = l.processStats(oper.stats, statsListenerContext);
       if (rsp != null) {
         //LOG.debug("Response to processStats = {}", rsp.repartitionRequired);
         oper.loadIndicator = rsp.loadIndicator;
@@ -1899,4 +1947,22 @@ public class PhysicalPlan implements Serializable
       return null;
     }
   }
+
+  /**
+   * An implementation for {@link StatsListenerContext} to access the DAG. Currently only method to extract
+   * operator name from operator instance id is provided. In future additional methods could be added.
+   */
+  private class StatsListenerContextImpl implements StatsListenerContext, Serializable
+  {
+    @Override
+    public String getOperatorName(int id)
+    {
+      PTOperator operator = getAllOperators().get(id);
+      if (operator != null) {
+        return operator.getName();
+      }
+      return null;
+    }
+  }
+
 }

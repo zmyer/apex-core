@@ -25,11 +25,11 @@ import java.nio.channels.SelectionKey;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Iterator;
 import java.util.Map.Entry;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
@@ -51,9 +51,10 @@ import com.datatorrent.bufferserver.packet.Tuple;
 import com.datatorrent.bufferserver.storage.Storage;
 import com.datatorrent.common.util.NameableThreadFactory;
 import com.datatorrent.netlet.AbstractLengthPrependerClient;
+import com.datatorrent.netlet.AbstractServer;
 import com.datatorrent.netlet.DefaultEventLoop;
 import com.datatorrent.netlet.EventLoop;
-import com.datatorrent.netlet.Listener.ServerListener;
+import com.datatorrent.netlet.WriteOnlyLengthPrependerClient;
 import com.datatorrent.netlet.util.VarInt;
 
 /**
@@ -62,30 +63,33 @@ import com.datatorrent.netlet.util.VarInt;
  *
  * @since 0.3.2
  */
-public class Server implements ServerListener
+public class Server extends AbstractServer
 {
   public static final int DEFAULT_BUFFER_SIZE = 64 * 1024 * 1024;
   public static final int DEFAULT_NUMBER_OF_CACHED_BLOCKS = 8;
   private final int port;
   private String identity;
   private Storage storage;
-  private EventLoop eventloop;
-  private InetSocketAddress address;
+  private final EventLoop eventloop;
   private final ExecutorService serverHelperExecutor;
   private final ExecutorService storageHelperExecutor;
+  private volatile CountDownLatch latch;
 
   private byte[] authToken;
+
+  private static final boolean BACK_PRESSURE_ENABLED = !Boolean.getBoolean("org.apache.apex.bufferserver.backpressure.disable");
 
   /**
    * @param port - port number to bind to or 0 to auto select a free port
    */
-  public Server(int port)
+  public Server(EventLoop eventloop, int port)
   {
-    this(port, DEFAULT_BUFFER_SIZE, DEFAULT_NUMBER_OF_CACHED_BLOCKS);
+    this(eventloop, port, DEFAULT_BUFFER_SIZE, DEFAULT_NUMBER_OF_CACHED_BLOCKS);
   }
 
-  public Server(int port, int blocksize, int numberOfCacheBlocks)
+  public Server(EventLoop eventloop, int port, int blocksize, int numberOfCacheBlocks)
   {
+    this.eventloop = eventloop;
     this.port = port;
     this.blockSize = blocksize;
     this.numberOfCacheBlocks = numberOfCacheBlocks;
@@ -102,22 +106,22 @@ public class Server implements ServerListener
   }
 
   @Override
-  public synchronized void registered(SelectionKey key)
+  public void registered(SelectionKey key)
   {
-    ServerSocketChannel channel = (ServerSocketChannel)key.channel();
-    address = (InetSocketAddress)channel.socket().getLocalSocketAddress();
-    logger.info("Server started listening at {}", address);
-    notifyAll();
+    super.registered(key);
+    logger.info("Server started listening at {}", getServerAddress());
+    latch.countDown();
+    latch = null;
   }
 
   @Override
   public void unregistered(SelectionKey key)
   {
     for (LogicalNode ln : subscriberGroups.values()) {
-      ln.boot(eventloop);
+      ln.boot();
     }
     /*
-     * There may be unregister tasks scheduled to run on the event loop that use serverHelperExecutor.
+     * There may be un-register tasks scheduled to run on the event loop that use serverHelperExecutor.
      */
     eventloop.submit(new Runnable()
     {
@@ -128,27 +132,100 @@ public class Server implements ServerListener
         storageHelperExecutor.shutdown();
         try {
           serverHelperExecutor.awaitTermination(5000, TimeUnit.MILLISECONDS);
+          storageHelperExecutor.awaitTermination(5000, TimeUnit.MILLISECONDS);
         } catch (InterruptedException ex) {
           logger.debug("Executor Termination", ex);
         }
-        logger.info("Server stopped listening at {}", address);
+        logger.info("Server stopped listening at {}", getServerAddress());
+        latch.countDown();
+        latch = null;
       }
     });
   }
 
-  public synchronized InetSocketAddress run(EventLoop eventloop)
+  public InetSocketAddress run()
   {
+    final CountDownLatch latch = new CountDownLatch(1);
+    this.latch = latch;
     eventloop.start(null, port, this);
-    while (address == null) {
+    try {
+      latch.await();
+    } catch (InterruptedException e) {
+      throw new RuntimeException(e);
+    }
+    return (InetSocketAddress)getServerAddress();
+  }
+
+  public InetSocketAddress run(long time)
+  {
+    if (time < 0) {
+      throw new IllegalArgumentException(String.format("Wait time %d can't be negative", time));
+    }
+    final CountDownLatch latch = new CountDownLatch(1);
+    this.latch = latch;
+    eventloop.start(null, port, this);
+    final long deadline = System.currentTimeMillis() + time;
+    try {
+      while (latch.getCount() != 0 && time > 0 && latch.await(time, TimeUnit.MILLISECONDS)) {
+        time = deadline - System.currentTimeMillis();
+      }
+    } catch (InterruptedException e) {
+      throw new RuntimeException(e);
+    }
+    return (InetSocketAddress)getServerAddress();
+  }
+
+  public void stop()
+  {
+    final CountDownLatch latch = new CountDownLatch(1);
+    this.latch = latch;
+    eventloop.stop(this);
+    try {
+      latch.await();
+    } catch (InterruptedException e) {
+      throw new RuntimeException(e);
+    } finally {
+      shutdownExecutors(latch.getCount() == 0);
+    }
+  }
+
+  public void stop(long time)
+  {
+    if (time < 0) {
+      throw new IllegalArgumentException(String.format("Wait time %d can't be negative", time));
+    }
+    final CountDownLatch latch = new CountDownLatch(1);
+    this.latch = latch;
+    eventloop.stop(this);
+    final long deadline = System.currentTimeMillis() + time;
+    try {
+      while (latch.getCount() != 0 && time > 0 && latch.await(time, TimeUnit.MILLISECONDS)) {
+        time = deadline - System.currentTimeMillis();
+      }
+    } catch (InterruptedException e) {
+      throw new RuntimeException(e);
+    } finally {
+      shutdownExecutors(latch.getCount() == 0);
+    }
+  }
+
+  private void shutdownExecutors(boolean isTerminated)
+  {
+    if (!isTerminated) {
+      logger.warn("Buffer server {} did not terminate.", this);
       try {
-        wait(20);
-      } catch (InterruptedException ex) {
-        throw new RuntimeException(ex);
+        if (!serverHelperExecutor.isTerminated()) {
+          logger.warn("Forcing termination of {}", serverHelperExecutor);
+          serverHelperExecutor.shutdownNow();
+        }
+        if (!storageHelperExecutor.isTerminated()) {
+          logger.warn("Forcing termination of {}", storageHelperExecutor);
+          storageHelperExecutor.shutdownNow();
+        }
+      } catch (RuntimeException e) {
+        logger.error("Exception while terminating executors", e);
       }
     }
-
-    this.eventloop = eventloop;
-    return address;
   }
 
   public void setAuthToken(byte[] authToken)
@@ -171,18 +248,19 @@ public class Server implements ServerListener
     }
 
     DefaultEventLoop eventloop = DefaultEventLoop.createEventLoop("alone");
-    eventloop.start(null, port, new Server(port));
-    new Thread(eventloop).start();
+    Thread thread = eventloop.start();
+    new Server(eventloop, port).run();
+    thread.join();
   }
 
   @Override
   public String toString()
   {
-    return getClass().getSimpleName() + '@' + Integer.toHexString(hashCode()) + "{address=" + address + "}";
+    return getClass().getSimpleName() + '@' + Integer.toHexString(hashCode()) + "{address=" + getServerAddress() + "}";
   }
 
   private final ConcurrentHashMap<String, DataList> publisherBuffers = new ConcurrentHashMap<>(1, 0.75f, 1);
-  private final ConcurrentHashMap<String, LogicalNode> subscriberGroups = new ConcurrentHashMap<String, LogicalNode>();
+  private final ConcurrentHashMap<String, LogicalNode> subscriberGroups = new ConcurrentHashMap<>();
   private final ConcurrentHashMap<String, AbstractLengthPrependerClient> publisherChannels = new ConcurrentHashMap<>();
   private final int blockSize;
   private final int numberOfCacheBlocks;
@@ -267,8 +345,8 @@ public class Server implements ServerListener
           DataList dl = publisherBuffers.get(upstream_identifier);
           if (dl == null) {
             dl = Tuple.FAST_VERSION.equals(request.getVersion()) ?
-                new FastDataList(upstream_identifier, blockSize, numberOfCacheBlocks) :
-                new DataList(upstream_identifier, blockSize, numberOfCacheBlocks);
+                new FastDataList(upstream_identifier, blockSize, numberOfCacheBlocks, BACK_PRESSURE_ENABLED) :
+                new DataList(upstream_identifier, blockSize, numberOfCacheBlocks, BACK_PRESSURE_ENABLED);
             DataList odl = publisherBuffers.putIfAbsent(upstream_identifier, dl);
             if (odl != null) {
               dl = odl;
@@ -279,7 +357,7 @@ public class Server implements ServerListener
           final String type = request.getStreamType();
           final long skipWindowId = (long)request.getBaseSeconds() << 32 | request.getWindowId();
           final LogicalNode ln = new LogicalNode(identifier, upstream_identifier, type, dl
-              .newIterator(skipWindowId), skipWindowId);
+              .newIterator(skipWindowId), skipWindowId, eventloop);
 
           int mask = request.getMask();
           if (mask != 0) {
@@ -289,16 +367,19 @@ public class Server implements ServerListener
           }
           final LogicalNode oln = subscriberGroups.put(type, ln);
           if (oln != null) {
-            oln.boot(eventloop);
+            oln.boot();
           }
-          AbstractLengthPrependerClient subscriber = new Subscriber(ln, request.getBufferSize());
-
-          subscriber.registered(key);
-          key.attach(subscriber);
-          key.interestOps(SelectionKey.OP_WRITE | SelectionKey.OP_READ);
-
-          ln.catchUp();
-          dl.addDataListener(ln);
+          final Subscriber subscriber = new Subscriber(ln, request.getBufferSize());
+          eventloop.submit(new Runnable()
+          {
+            @Override
+            public void run()
+            {
+              key.attach(subscriber);
+              subscriber.registered(key);
+              subscriber.connected();
+            }
+          });
         }
       });
     } catch (RejectedExecutionException e) {
@@ -387,8 +468,8 @@ public class Server implements ServerListener
       }
     } else {
       dl = Tuple.FAST_VERSION.equals(request.getVersion()) ?
-          new FastDataList(identifier, blockSize, numberOfCacheBlocks) :
-          new DataList(identifier, blockSize, numberOfCacheBlocks);
+          new FastDataList(identifier, blockSize, numberOfCacheBlocks, BACK_PRESSURE_ENABLED) :
+          new DataList(identifier, blockSize, numberOfCacheBlocks, BACK_PRESSURE_ENABLED);
       DataList odl = publisherBuffers.putIfAbsent(identifier, dl);
       if (odl != null) {
         dl = odl;
@@ -513,7 +594,7 @@ public class Server implements ServerListener
           /*
            * unregister the unidentified client since its job is done!
            */
-          unregistered(key);
+          unregistered(key.interestOps(0));
           ignore = true;
           logger.info("Received subscriber request: {}", request);
 
@@ -545,23 +626,35 @@ public class Server implements ServerListener
 
   }
 
-  class Subscriber extends AbstractLengthPrependerClient
+  private class Subscriber extends WriteOnlyLengthPrependerClient
   {
     private LogicalNode ln;
 
     Subscriber(LogicalNode ln, int bufferSize)
     {
-      super(1024, bufferSize);
+      super(1024 * 1024, bufferSize == 0 ? 256 * 1024 : bufferSize);
       this.ln = ln;
       ln.addConnection(this);
-      super.write = false;
     }
 
     @Override
-    public void onMessage(byte[] buffer, int offset, int size)
+    public void connected()
     {
-      logger.warn("Received data when no data is expected: {}",
-          Arrays.toString(Arrays.copyOfRange(buffer, offset, offset + size)));
+      super.connected();
+      serverHelperExecutor.submit(new Runnable()
+      {
+        @Override
+        public void run()
+        {
+          final DataList dl = publisherBuffers.get(ln.getUpstream());
+          if (dl != null) {
+            dl.addDataListener(ln);
+          } else {
+            logger.error("Disconnecting {} with no matching data list.", this);
+            ln.boot();
+          }
+        }
+      });
     }
 
     @Override
@@ -713,7 +806,7 @@ public class Server implements ServerListener
 
     private boolean switchToNewBuffer(final byte[] array, final int offset, final int size)
     {
-      if (datalist.isMemoryBlockAvailable()) {
+      if ((datalist.isMemoryBlockAvailable() || ((storage == null)) && !datalist.areSubscribersBehindByMax())) {
         final byte[] newBuffer = datalist.newBuffer(size);
         byteBuffer = ByteBuffer.wrap(newBuffer);
         if (array == null || array.length - offset == 0) {
@@ -789,7 +882,7 @@ public class Server implements ServerListener
         }
       }
 
-      ArrayList<LogicalNode> list = new ArrayList<LogicalNode>();
+      ArrayList<LogicalNode> list = new ArrayList<>();
       String publisherIdentifier = datalist.getIdentifier();
       Iterator<LogicalNode> iterator = subscriberGroups.values().iterator();
       while (iterator.hasNext()) {
@@ -800,7 +893,7 @@ public class Server implements ServerListener
       }
 
       for (LogicalNode ln : list) {
-        ln.boot(eventloop);
+        ln.boot();
       }
     }
 
